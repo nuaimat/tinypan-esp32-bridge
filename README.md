@@ -8,6 +8,9 @@ Phone (BT Hotspot) ──▶ ESP32 ──▶ WiFi AP ──▶ Laptop / Tablet /
 
 Built on [TinyPAN](https://github.com/Akhil-Chaturvedi/TinyPAN), a zero-allocation Bluetooth PAN client library for microcontrollers.
 
+> [!IMPORTANT]
+> **This is an experimental, vibe-coded project.** The firmware works but is flaky and not bug-free — expect connection drops, packet loss, and rough edges. Bluetooth and WiFi sharing the same 2.4 GHz radio on the ESP32 is an inherently difficult coexistence problem. Pull requests are very welcome and encouraged — see [Contributing](#contributing).
+
 ## Features
 
 - **Bluetooth PAN client** — connects to Android/iOS Personal Hotspot via BNEP (Bluetooth Classic)

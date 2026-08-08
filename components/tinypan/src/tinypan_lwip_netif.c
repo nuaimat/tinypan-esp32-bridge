@@ -1,0 +1,554 @@
+/*
+ * TinyPAN lwIP Network Interface Adapter - Implementation
+ * 
+ * Registers the lwIP netif (tp0) and delegates packet output/input
+ * to the active transport backend via tinypan_transport_get().
+ */
+
+#include "tinypan_lwip_netif.h"
+#include "tinypan_bnep.h"
+#include "../include/tinypan_config.h"
+#include "../include/tinypan_hal.h"
+#include "tinypan_internal.h"
+
+/* lwIP includes */
+#include "lwip/opt.h"
+#include "lwip/def.h"
+#include "lwip/mem.h"
+#include "lwip/pbuf.h"
+#include "lwip/sys.h"
+#include "lwip/timeouts.h"
+#include "lwip/etharp.h"
+#include "lwip/dhcp.h"
+#include "lwip/dns.h"
+#include "lwip/init.h"
+#include "lwip/netif.h"
+#include "lwip/ip4_addr.h"
+#include "lwip/tcpip.h"
+#include "netif/ethernet.h"
+
+#if TINYPAN_USE_BLE_SLIP
+#include "lwip/ip.h"
+#endif
+
+#include "tinypan_transport.h"
+
+#include <string.h>
+
+/* ============================================================================
+ * Constants
+ * ============================================================================ */
+
+/** Interface name (appears as "tp0" in debug output) */
+#define IFNAME0 't'
+#define IFNAME1 'p'
+
+/** MTU - standard Ethernet */
+#define TINYPAN_MTU 1500
+
+/* ============================================================================
+ * Static State
+ * ============================================================================ */
+
+/** The lwIP network interface */
+static struct netif s_netif;
+
+/** Flag: is the netif initialized? */
+static bool s_initialized = false;
+
+/** Local MAC address (derived from Bluetooth address) */
+static uint8_t s_mac_addr[6] = {0};
+
+/* The active transport layer handles TX/RX queues and sio interfaces */
+
+/* ============================================================================
+ * TCP/IP Thread Context Execution (RTOS mode)
+ *
+ * In NO_SYS=0 environments, lwIP structures (netif list, DHCP state) may only
+ * be mutated from the tcpip_thread. These helpers synchronously execute a
+ * function in that context. In NO_SYS=1, functions run inline.
+ * ============================================================================ */
+
+#if !NO_SYS
+typedef struct {
+    void (*fn)(void* arg);
+    void* arg;
+    sys_sem_t done;
+} tcpip_exec_msg_t;
+
+static void tcpip_exec_cb(void* ctx) {
+    tcpip_exec_msg_t* msg = (tcpip_exec_msg_t*)ctx;
+    msg->fn(msg->arg);
+    sys_sem_signal(&msg->done);
+}
+#endif
+
+/** Execute fn(arg) in lwIP's tcpip_thread context and wait for completion.
+ *
+ * 'msg' is stack-allocated and its address is posted to the tcpip_thread mbox.
+ * The caller then blocks on sys_sem_wait(). FreeRTOS preserves the blocked
+ * task's stack in its TCB — it cannot be overwritten by preemption because
+ * every task has its own stack. The tcpip_thread signals msg.done, the caller
+ * wakes, and 'msg' is still valid on its own stack. Safe.
+ */
+static void netif_run_in_lwip_ctx(void (*fn)(void* arg), void* arg) {
+#if NO_SYS
+    fn(arg);
+#else
+    tcpip_exec_msg_t msg;
+    msg.fn = fn;
+    msg.arg = arg;
+    if (sys_sem_new(&msg.done, 0) != ERR_OK) {
+        TINYPAN_LOG_WARN("netif: sem alloc failed, running op inline");
+        fn(arg);
+        return;
+    }
+    if (tcpip_callback(tcpip_exec_cb, &msg) == ERR_OK) {
+        sys_sem_wait(&msg.done);
+    } else {
+        TINYPAN_LOG_WARN("netif: tcpip_callback failed, running op inline");
+        fn(arg);
+    }
+    sys_sem_free(&msg.done);
+#endif
+}
+
+/*
+ * Private forward declaration for link status
+ */
+static void tinypan_netif_status_callback(struct netif* netif);
+static err_t tinypan_netif_linkoutput(struct netif* netif, struct pbuf* p);
+
+#if TINYPAN_USE_BLE_SLIP
+static err_t tinypan_slip_output_wrapper(struct netif *netif, struct pbuf *p, const ip4_addr_t *ipaddr) {
+    (void)ipaddr;
+    return tinypan_netif_linkoutput(netif, p);
+}
+#endif
+
+/* ============================================================================
+ * Internal lwIP API mapping
+ * ============================================================================ */
+
+/**
+ * @brief lwIP network interface initialization callback
+ */
+static err_t tinypan_netif_init_callback(struct netif* netif) {
+    LWIP_ASSERT("netif != NULL", (netif != NULL));
+    
+    /* Set interface name */
+    netif->name[0] = 't';
+    netif->name[1] = 'p';
+    
+    const tinypan_transport_t* transport = tinypan_transport_get();
+    
+    if (transport == &transport_slip) {
+        TINYPAN_LOG_INFO("Configuring lwIP netif for SLIP (BLE Companion Mode)");
+        netif->mtu = TINYPAN_MTU;
+        netif->flags = NETIF_FLAG_IGMP;
+#if TINYPAN_USE_BLE_SLIP
+        netif->output = tinypan_slip_output_wrapper;
+#endif
+    } else {
+        TINYPAN_LOG_INFO("Configuring lwIP netif for Ethernet (Native Mode)");
+        netif->output = etharp_output;
+        netif->linkoutput = tinypan_netif_linkoutput;
+        netif->hwaddr_len = 6;
+        memcpy(netif->hwaddr, s_mac_addr, 6);
+        netif->mtu = TINYPAN_MTU;
+        netif->flags = NETIF_FLAG_BROADCAST | NETIF_FLAG_ETHARP | NETIF_FLAG_ETHERNET;
+    }
+
+    /* Enable link callback */
+#if LWIP_NETIF_STATUS_CALLBACK
+    netif_set_status_callback(netif, tinypan_netif_status_callback);
+#endif
+    
+    TINYPAN_LOG_INFO("lwIP netif initialized: %c%c",
+                      netif->name[0], netif->name[1]);
+    
+    
+    return ERR_OK;
+}
+
+/* ============================================================================
+ * Output Functions (Sending)
+ * ============================================================================ */
+
+static err_t tinypan_netif_linkoutput(struct netif* netif, struct pbuf* p) {
+    const tinypan_transport_t* transport = tinypan_transport_get();
+    if (transport && transport->output) {
+        TINYPAN_LOG_DEBUG("netif TX: %u bytes", (unsigned)p->tot_len);
+        return transport->output(netif, p);
+    }
+    TINYPAN_LOG_WARN("netif TX: no transport output, dropping %u bytes", (unsigned)p->tot_len);
+    return ERR_IF;
+}
+
+/* ============================================================================
+ * Status Callback
+ * ============================================================================ */
+
+/**
+ * @brief Called when netif status changes (IP assigned, etc.)
+ */
+static void tinypan_netif_status_callback(struct netif* netif) {
+    if (netif_is_up(netif)) {
+        const ip4_addr_t* ip = netif_ip4_addr(netif);
+        const ip4_addr_t* gw = netif_ip4_gw(netif);
+        const ip4_addr_t* mask = netif_ip4_netmask(netif);
+        
+        if (ip->addr != 0) {
+            TINYPAN_LOG_INFO("netif: IP acquired!");
+            TINYPAN_LOG_INFO("  IP:      %d.%d.%d.%d",
+                             ip4_addr1(ip), ip4_addr2(ip),
+                             ip4_addr3(ip), ip4_addr4(ip));
+            TINYPAN_LOG_INFO("  Gateway: %d.%d.%d.%d",
+                             ip4_addr1(gw), ip4_addr2(gw),
+                             ip4_addr3(gw), ip4_addr4(gw));
+            TINYPAN_LOG_INFO("  Netmask: %d.%d.%d.%d",
+                             ip4_addr1(mask), ip4_addr2(mask),
+                             ip4_addr3(mask), ip4_addr4(mask));
+            
+            /* Read DNS server from lwIP DHCP client */
+            const ip_addr_t *dns = dns_getserver(0);
+            uint32_t dns_addr = dns ? ip_addr_get_ip4_u32(dns) : 0;
+            TINYPAN_LOG_INFO("  DNS:     %d.%d.%d.%d",
+                             (int)(dns_addr & 0xFF), (int)((dns_addr >> 8) & 0xFF),
+                             (int)((dns_addr >> 16) & 0xFF), (int)((dns_addr >> 24) & 0xFF));
+
+            /* Notify the main TinyPAN module */
+            tinypan_internal_set_ip(ip->addr, mask->addr, gw->addr, dns_addr);
+        } else {
+            /* Link desync recovery: clear IP if address is lost/expired */
+            tinypan_internal_clear_ip();
+        }
+    }
+}
+
+/* ============================================================================
+ * Public API Implementation
+ * ============================================================================ */
+
+typedef struct {
+    ip4_addr_t ipaddr;
+    ip4_addr_t netmask;
+    ip4_addr_t gateway;
+    int result;
+} netif_add_ctx_t;
+
+static void do_netif_add(void* arg) {
+    netif_add_ctx_t* ctx = (netif_add_ctx_t*)arg;
+
+#if TINYPAN_USE_BLE_SLIP
+#if NO_SYS
+    struct netif* ret = netif_add(&s_netif, &ctx->ipaddr, &ctx->netmask, &ctx->gateway,
+                                  NULL, tinypan_netif_init_callback, ip_input);
+#else
+    struct netif* ret = netif_add(&s_netif, &ctx->ipaddr, &ctx->netmask, &ctx->gateway,
+                                  NULL, tinypan_netif_init_callback, tcpip_input);
+#endif
+#else
+#if NO_SYS
+    struct netif* ret = netif_add(&s_netif, &ctx->ipaddr, &ctx->netmask, &ctx->gateway,
+                                  NULL, tinypan_netif_init_callback, ethernet_input);
+#else
+    /* RTOS mode: tcpip_input dispatches to ethernet_input/ip_input based on
+     * netif flags, after safely crossing into the tcpip_thread. */
+    struct netif* ret = netif_add(&s_netif, &ctx->ipaddr, &ctx->netmask, &ctx->gateway,
+                                  NULL, tinypan_netif_init_callback, tcpip_input);
+#endif
+#endif
+    if (ret == NULL) {
+        ctx->result = -1;
+        return;
+    }
+
+    /* Set as default interface */
+    netif_set_default(&s_netif);
+    ctx->result = 0;
+}
+
+int tinypan_netif_init(void) {
+    if (s_initialized) {
+        TINYPAN_LOG_WARN("netif: Already initialized");
+        return 0;
+    }
+    
+    /* Get MAC address from Bluetooth address */
+    hal_get_local_bd_addr(s_mac_addr);
+    
+    /* Set the locally administered bit to make it a valid unicast MAC */
+    /* Bit 1 of first byte = locally administered */
+    s_mac_addr[0] |= 0x02;
+    /* Clear multicast bit */
+    s_mac_addr[0] &= ~0x01;
+    
+    TINYPAN_LOG_INFO("netif: MAC address: %02X:%02X:%02X:%02X:%02X:%02X",
+                      s_mac_addr[0], s_mac_addr[1], s_mac_addr[2],
+                      s_mac_addr[3], s_mac_addr[4], s_mac_addr[5]);
+    
+    /* Initialize lwIP stack core if requested and not already done */
+    const tinypan_config_t* config = tinypan_internal_get_config();
+    static bool s_lwip_initialized_by_us = false;
+    if (config && config->auto_init_lwip && !s_lwip_initialized_by_us) {
+        /* WARNING: In shared stack environments (ESP32), the OS usually calls this. */
+        lwip_init();
+        s_lwip_initialized_by_us = true;
+    }
+    
+    /* Add our network interface (must run in tcpip_thread context) */
+    netif_add_ctx_t ctx;
+    IP4_ADDR(&ctx.ipaddr, 0, 0, 0, 0);
+    IP4_ADDR(&ctx.netmask, 0, 0, 0, 0);
+    IP4_ADDR(&ctx.gateway, 0, 0, 0, 0);
+    ctx.result = -1;
+
+    netif_run_in_lwip_ctx(do_netif_add, &ctx);
+    if (ctx.result != 0) {
+        TINYPAN_LOG_ERROR("netif: Failed to add interface");
+        return -1;
+    }
+    
+    s_initialized = true;
+    
+    TINYPAN_LOG_INFO("netif: Initialized successfully");
+    return 0;
+}
+
+static void do_netif_remove(void* arg) {
+    (void)arg;
+    dhcp_stop(&s_netif);
+    netif_remove(&s_netif);
+}
+
+void tinypan_netif_deinit(void) {
+    if (!s_initialized) {
+        return;
+    }
+    
+    /* Stop DHCP and remove the interface (in tcpip_thread context) */
+    netif_run_in_lwip_ctx(do_netif_remove, NULL);
+    
+    s_initialized = false;
+    TINYPAN_LOG_INFO("netif: De-initialized");
+}
+
+static void do_dhcp_restart(void* arg) {
+    err_t* err = (err_t*)arg;
+    dhcp_stop(&s_netif);
+    *err = dhcp_start(&s_netif);
+}
+
+static void do_dhcp_stop(void* arg) {
+    (void)arg;
+    dhcp_stop(&s_netif);
+}
+
+int tinypan_netif_start_dhcp(void) {
+    if (!s_initialized) {
+        TINYPAN_LOG_ERROR("netif: Not initialized");
+        return -1;
+    }
+    
+    TINYPAN_LOG_INFO("netif: Starting DHCP...");
+    
+    /* DHCP requires Ethernet broadcast and a MAC addr. 
+     * SLIP is Raw IP/P2P; prohibit DHCP to avoid silent failures. */
+    const tinypan_transport_t* transport = tinypan_transport_get();
+    if (transport == &transport_slip) {
+        TINYPAN_LOG_ERROR("netif: DHCP is not supported in SLIP mode (Raw IP/P2P)");
+        TINYPAN_LOG_ERROR("  Integrators must use static IP assignment via tinypan_init()");
+        return -1;
+    }
+
+    err_t err = ERR_OK;
+    netif_run_in_lwip_ctx(do_dhcp_restart, &err);
+    if (err != ERR_OK) {
+        TINYPAN_LOG_ERROR("netif: DHCP start failed: %d", err);
+        return -1;
+    }
+    
+    return 0;
+}
+
+void tinypan_netif_stop_dhcp(void) {
+    if (!s_initialized) {
+        return;
+    }
+    
+    netif_run_in_lwip_ctx(do_dhcp_stop, NULL);
+    TINYPAN_LOG_INFO("netif: DHCP stopped");
+}
+
+static void do_set_link(void* arg) {
+    bool up = *(bool*)arg;
+    if (up) {
+        netif_set_link_up(&s_netif);
+        netif_set_up(&s_netif);
+    } else {
+        netif_set_link_down(&s_netif);
+        netif_set_down(&s_netif);
+    }
+}
+
+void tinypan_netif_set_link(bool up) {
+    if (!s_initialized) {
+        return;
+    }
+    
+    netif_run_in_lwip_ctx(do_set_link, &up);
+    TINYPAN_LOG_INFO("netif: Link %s", up ? "UP" : "DOWN");
+}
+
+void tinypan_netif_input(const uint8_t* dst_addr, const uint8_t* src_addr,
+                          uint16_t ethertype, const uint8_t* payload,
+                          uint16_t payload_len) {
+    if (!s_initialized) {
+        return;
+    }
+    
+    if (dst_addr == NULL || src_addr == NULL) {
+        return;
+    }
+    
+    /* Strict bounds check to prevent uint16_t overflow (14 + payload_len)
+     * and heap corruption in subsequent pbuf_take_at calls. */
+    if (payload_len > TINYPAN_MAX_FRAME_SIZE) {
+        TINYPAN_LOG_WARN("netif: Packet too large (%u)", payload_len);
+        return;
+    }
+
+    uint16_t total_len = 14 + payload_len;
+    TINYPAN_LOG_DEBUG("netif RX: %u bytes", total_len);
+    
+    /* Allocate a pbuf to hold the received data directly into lwIP pool */
+#if defined(ETH_PAD_SIZE) && ETH_PAD_SIZE > 0
+    struct pbuf* p = pbuf_alloc(PBUF_RAW, total_len + ETH_PAD_SIZE, PBUF_POOL);
+#else
+    struct pbuf* p = pbuf_alloc(PBUF_RAW, total_len, PBUF_POOL);
+#endif
+    if (p == NULL) {
+        TINYPAN_LOG_WARN("netif: Failed to allocate pbuf for RX");
+        return;
+    }
+
+#if defined(ETH_PAD_SIZE) && ETH_PAD_SIZE > 0
+    pbuf_remove_header(p, ETH_PAD_SIZE); /* Drop padding space temporarily for copying */
+#endif
+
+    /* Write 14-byte Ethernet header directly. PBUF_POOL_BUFSIZE guarantees 
+     * this fits contiguously within the first segment, avoiding O(N) traversal. */
+    uint8_t* p_data = (uint8_t*)p->payload;
+    memcpy(p_data, dst_addr, 6);
+    memcpy(p_data + 6, src_addr, 6);
+    p_data[12] = (uint8_t)(ethertype >> 8);
+    p_data[13] = (uint8_t)(ethertype & 0xFF);
+    
+    /* Copy the payload, which may span multiple pbuf pool blocks */
+    if (payload != NULL && payload_len > 0) {
+        pbuf_take_at(p, payload, payload_len, 14);
+    }
+    
+#if defined(ETH_PAD_SIZE) && ETH_PAD_SIZE > 0
+    pbuf_add_header(p, ETH_PAD_SIZE); /* Restore padding space before handing to lwIP */
+#endif
+    
+    /* Pass to lwIP input. In RTOS/NO_SYS=0 mode, netif->input is tcpip_input,
+     * which safely posts the frame to the tcpip_thread. In bare-metal mode it
+     * is ethernet_input/ip_input, called directly. */
+    if (s_netif.input == NULL) {
+        TINYPAN_LOG_WARN("netif: input callback is NULL, dropping frame");
+        pbuf_free(p);
+        return;
+    }
+    err_t inp_err = s_netif.input(p, &s_netif);
+    if (inp_err != ERR_OK) {
+        TINYPAN_LOG_WARN("netif: Input processing failed (err=%d)", inp_err);
+        pbuf_free(p);
+    }
+}
+
+struct netif* tinypan_netif_get(void) {
+    return s_initialized ? &s_netif : NULL;
+}
+
+bool tinypan_netif_has_ip(void) {
+    if (!s_initialized) {
+        return false;
+    }
+    return netif_ip4_addr(&s_netif)->addr != 0;
+}
+
+uint32_t tinypan_netif_get_ip(void) {
+    if (!s_initialized) {
+        return 0;
+    }
+    return netif_ip4_addr(&s_netif)->addr;
+}
+
+uint32_t tinypan_netif_get_gateway(void) {
+    if (!s_initialized) {
+        return 0;
+    }
+    return netif_ip4_gw(&s_netif)->addr;
+}
+
+uint32_t tinypan_netif_get_netmask(void) {
+    if (!s_initialized) {
+        return 0;
+    }
+    return netif_ip4_netmask(&s_netif)->addr;
+}
+
+/* ============================================================================
+ * lwIP Timeout Processing
+ * ============================================================================ */
+
+/**
+ * @brief Process lwIP timers
+ * 
+ * Must be called periodically from the main loop.
+ * This handles DHCP retries, ARP timeouts, TCP timers, etc.
+ */
+void tinypan_netif_process(void) {
+    if (!s_initialized) {
+        return;
+    }
+    
+    /* Process lwIP timers only if running in bare-metal (NO_SYS=1) mode.
+     * In OS-mode (ESP32/Zephyr), lwIP's tcpip_thread handles its own timeouts. */
+#if NO_SYS
+    sys_check_timeouts();
+#endif
+}
+
+void tinypan_netif_flush_queue(void) {
+    const tinypan_transport_t* transport = tinypan_transport_get();
+    if (transport && transport->flush_queues) {
+        transport->flush_queues();
+    }
+}
+
+void tinypan_netif_drain_tx_queue(void) {
+    /* Called when radio is ready - now dispatched by transport's on_can_send_now
+       but kept for public API compatibility. */
+    const tinypan_transport_t* transport = tinypan_transport_get();
+    if (transport && transport->on_can_send_now) {
+        transport->on_can_send_now();
+    }
+}
+
+
+
+/* ============================================================================
+ * lwIP System Time Provider
+ * ============================================================================ */
+
+#if NO_SYS
+#if !TINYPAN_HOST_PROVIDES_SYS_NOW
+u32_t sys_now(void) {
+    return hal_get_tick_ms();
+}
+#endif /* !TINYPAN_HOST_PROVIDES_SYS_NOW */
+#endif

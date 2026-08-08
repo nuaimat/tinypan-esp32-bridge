@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TinyPAN Bridge</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="container">
+
+  <!-- ═══ Header ═══ -->
+  <header>
+    <div class="header-row">
+      <h1>TinyPAN Bridge</h1>
+      <span id="header-dot" class="dot off" title="Status"></span>
+    </div>
+    <p class="subtitle">Bluetooth PAN → Wi-Fi Hotspot</p>
+  </header>
+
+  <main>
+
+    <!-- ═══ Status Panel ═══ -->
+    <section class="card">
+      <h2>Status</h2>
+      <div class="status-grid">
+        <div class="status-row">
+          <span class="label">Bluetooth</span>
+          <span id="bt-status" class="value">—</span>
+        </div>
+        <div class="status-row">
+          <span class="label">PAN Link</span>
+          <span id="pan-status" class="value">—</span>
+        </div>
+        <div class="status-row">
+          <span class="label">AP IP</span>
+          <span id="ap-ip" class="value">—</span>
+        </div>
+        <div class="status-row">
+          <span class="label">WiFi Clients</span>
+          <span id="wifi-clients" class="value">—</span>
+        </div>
+        <div class="status-row">
+          <span class="label">Uptime</span>
+          <span id="uptime" class="value">—</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══ Bluetooth Panel ═══ -->
+    <section class="card">
+      <h2>Bluetooth</h2>
+      <div id="bt-connected-info" class="bt-connected hidden">
+        <div class="status-row">
+          <span class="label">Connected to</span>
+          <span id="bt-peer-name" class="value"></span>
+        </div>
+        <div class="status-row">
+          <span class="label">Address</span>
+          <span id="bt-peer-bda" class="value mono"></span>
+        </div>
+        <button id="bt-disconnect-btn" class="btn-danger">Disconnect</button>
+      </div>
+      <div id="bt-disconnected-actions">
+        <button id="bt-scan-btn" class="btn-primary">Scan for Devices</button>
+        <div id="bt-scan-status" class="scan-status hidden"></div>
+        <ul id="bt-device-list" class="device-list hidden"></ul>
+      </div>
+    </section>
+
+    <!-- ═══ WiFi Panel ═══ -->
+    <section class="card">
+      <h2>WiFi Settings</h2>
+      <form id="wifi-form">
+        <div class="form-group">
+          <label for="wifi-ssid">SSID</label>
+          <input type="text" id="wifi-ssid" maxlength="32" placeholder="TinyPAN-Bridge">
+        </div>
+        <div class="form-group">
+          <label for="wifi-password">Password</label>
+          <div class="password-row">
+            <input type="password" id="wifi-password" maxlength="64" placeholder="bridge1234">
+            <button type="button" id="toggle-password" class="btn-icon" title="Show/hide password">👁</button>
+          </div>
+        </div>
+        <div class="form-group">
+          <label for="wifi-channel">Channel (1–13)</label>
+          <input type="number" id="wifi-channel" min="1" max="13" value="1">
+        </div>
+        <button type="submit" class="btn-primary">Save Settings</button>
+      </form>
+      <div id="wifi-save-status" class="save-status hidden"></div>
+    </section>
+
+  </main>
+
+  <footer>
+    <p>TinyPAN Bridge v1.0</p>
+  </footer>
+</div>
+
+<script src="/script.js"></script>
+</body>
+</html>

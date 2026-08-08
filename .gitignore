@@ -1,0 +1,37 @@
+# Build output
+build/
+build.broken.*/
+
+# Generated SDK config (keep sdkconfig.defaults only)
+sdkconfig
+sdkconfig.old
+
+# SPIFFS / build artifacts (root-level only)
+/www/
+
+# IDE / AI assistant tools
+.hermes/
+.serena/
+.windsurf/
+.vscode/
+.idea/
+.devin/
+.agents/
+.cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Dependencies (if any are vendored)
+managed_components/
+
+# Flash artifacts
+*.bin
+!components/**/*.bin
+flash_args
+flasher_args.json
+
+# Test / debug logs
+test_logs_*.log
+serial_log*

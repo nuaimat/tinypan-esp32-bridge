@@ -1,0 +1,42 @@
+menu "TinyPAN Bridge Configuration"
+
+    choice BRIDGE_BT_MODE
+        prompt "Bluetooth Transport Mode"
+        default BRIDGE_BT_MODE_BNEP
+        help
+            Select the Bluetooth transport mode for the TinyPAN bridge.
+
+        config BRIDGE_BT_MODE_BNEP
+            bool "BNEP (Bluetooth Network Encapsulation Protocol)"
+            help
+                Classic Bluetooth PAN profile using BNEP. Compatible with
+                most operating systems (Windows, macOS, Linux) out of the box.
+
+        config BRIDGE_BT_MODE_BLE_SLIP
+            bool "BLE SLIP (Serial Line IP over BLE)"
+            help
+                IP-over-BLE using SLIP framing over a BLE characteristic.
+                Lower power, works with iOS/Android BLE PAN apps.
+    endchoice
+
+    config BRIDGE_WIFI_SSID
+        string "WiFi AP SSID"
+        default "TinyPAN-Bridge"
+        help
+            SSID for the TinyPAN bridge WiFi access point.
+
+    config BRIDGE_WIFI_PASSWORD
+        string "WiFi AP Password"
+        default "bridge1234"
+        help
+            Password for the TinyPAN bridge WiFi access point.
+            Minimum 8 characters for WPA2.
+
+    config BRIDGE_HTTP_PORT
+        int "HTTP Server Port"
+        default 80
+        range 1 65535
+        help
+            TCP port for the built-in HTTP configuration server.
+
+endmenu

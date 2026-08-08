@@ -35,3 +35,5 @@ flasher_args.json
 # Test / debug logs
 test_logs_*.log
 serial_log*
+
+notes_do_not_commit.txt

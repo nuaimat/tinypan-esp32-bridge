@@ -59,6 +59,8 @@
 #include "tinypan.h"
 #include "tinypan_hal.h"       /* hal_bt_is_connected, hal_bt_get_last_rx_ms */
 #include "tinypan_internal.h"  /* tinypan_internal_get_config() */
+#include "router_config.h"
+#include "wifi_config.h"
 
 /* lwIP headers for NAT/route health check */
 #include "lwip/netif.h"
@@ -82,6 +84,16 @@ static uint32_t s_reconnect_set_ms = 0;   /* when the flag was last set */
  * offline-reboot fallback. Must exceed the on-demand max pause (120s) plus
  * reconnect time; after this, a genuinely stuck system still reboots. */
 #define RESILIENCE_RECONNECT_GRACE_MS  300000
+
+/* Probe task: runs the blocking DNS probe in a separate FreeRTOS task
+ * so the main loop can continue sending BNEP keepalives (every 2s).
+ * Without this, the probe blocks the main loop for 5-20s and the phone
+ * drops the BNEP connection due to keepalive timeout. */
+static TaskHandle_t  s_probe_task_handle   = NULL;
+static volatile bool s_probe_busy          = false;
+static volatile bool s_probe_done          = false;  /* result ready */
+static volatile bool s_probe_result        = false;
+static volatile uint32_t s_probe_rtt_ms    = 0;
 
 /* ── Helpers ───────────────────────────────────────────────────── */
 
@@ -155,66 +167,44 @@ static uint16_t build_dns_query(uint8_t *buf, uint16_t bufsize,
 }
 
 /**
- * Send a DNS query through the PAN interface and wait for a reply.
+ * Send a DNS query to a specific server through the PAN interface.
  *
- * Uses the DNS server learned from the phone's DHCP response
- * (ip_info.dns_server) so the probe tests the actual path that
- * clients use. This correctly handles VPN scenarios where the phone's
- * system DNS changes (e.g., Tailscale sets 100.100.100.100) — probing
- * 8.8.8.8 through a full-tunnel VPN would fail even though connectivity
- * is fine. Falls back to 8.8.8.8 if the DHCP DNS is 0.0.0.0.
+ * Two-stage probe strategy:
+ *   1. Probe 8.8.8.8 directly (fast — phone forwards IP packet without
+ *      DNS proxy processing). Should respond in <1s on cellular.
+ *   2. If 8.8.8.8 is blocked by the carrier, fall back to the phone's
+ *      DHCP-provided DNS forwarder. This is slower (Android's tethering
+ *      DNS proxy can take 10+ seconds due to DNS-over-HTTPS or IPv6-
+ *      first fallback) but works when 8.8.8.8 is blocked.
  *
- * Returns true if a valid DNS response was received.
+ * Returns true if either probe succeeds.
  */
-static bool probe_upstream_dns(void)
+static bool probe_single_dns(uint32_t dns_server_h, uint32_t pan_ip_h,
+                              uint32_t timeout_ms, uint16_t txid,
+                              uint32_t *out_rtt_ms)
 {
-    tinypan_ip_info_t ip_info;
-    if (pan_manager_get_ip_info(&ip_info) != ESP_OK) {
-        ESP_LOGD(TAG, "probe: no PAN IP info");
-        return false;
-    }
-
-    /* Use the phone's DHCP-provided DNS server for probing. This is the
-     * same server that captive_dns forwards client queries to, so a
-     * successful probe guarantees clients can resolve too. */
-    uint32_t dns_server_h = ip_info.dns_server;
-    if (dns_server_h == 0) {
-        ESP_LOGD(TAG, "probe: DHCP DNS is 0.0.0.0 — using fallback 8.8.8.8");
-        dns_server_h = RESILIENCE_PROBE_DNS_FALLBACK;
-    }
-
-    /* Bind the socket to the PAN interface IP so the query routes
-     * through Bluetooth, not the AP. This ensures we're actually
-     * testing the upstream path, not a local loopback. */
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sock < 0) {
-        ESP_LOGW(TAG, "probe: socket() failed errno=%d", errno);
         return false;
     }
 
-    /* Bind to PAN IP */
-    struct sockaddr_in bind_addr;
-    memset(&bind_addr, 0, sizeof(bind_addr));
+    /* Bind to PAN IP so the query routes through Bluetooth */
+    struct sockaddr_in bind_addr = {0};
     bind_addr.sin_family = AF_INET;
-    bind_addr.sin_addr.s_addr = ip_info.ip_addr;  /* already network order */
-    bind_addr.sin_port = 0;  /* ephemeral source port */
+    bind_addr.sin_addr.s_addr = pan_ip_h;
+    bind_addr.sin_port = 0;
     if (bind(sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
-        ESP_LOGW(TAG, "probe: bind() failed errno=%d", errno);
         close(sock);
         return false;
     }
 
-    /* Set receive timeout */
     struct timeval tv = {
-        .tv_sec  = RESILIENCE_PROBE_TIMEOUT_MS / 1000,
-        .tv_usec = (RESILIENCE_PROBE_TIMEOUT_MS % 1000) * 1000,
+        .tv_sec  = timeout_ms / 1000,
+        .tv_usec = (timeout_ms % 1000) * 1000,
     };
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    /* Build and send DNS query */
     uint8_t query[512];
-    uint16_t txid = (uint16_t)(now_ms() & 0xFFFF);
-    if (txid == 0) txid = 1;
     uint16_t qlen = build_dns_query(query, sizeof(query),
                                     RESILIENCE_PROBE_DOMAIN, txid);
     if (qlen == 0) {
@@ -222,55 +212,138 @@ static bool probe_upstream_dns(void)
         return false;
     }
 
-    struct sockaddr_in dst;
-    memset(&dst, 0, sizeof(dst));
+    struct sockaddr_in dst = {0};
     dst.sin_family = AF_INET;
     dst.sin_port = htons(53);
-    dst.sin_addr.s_addr = dns_server_h;  /* already network order */
+    dst.sin_addr.s_addr = dns_server_h;
 
     int sent = sendto(sock, query, qlen, 0,
                       (struct sockaddr *)&dst, sizeof(dst));
     if (sent <= 0) {
-        ESP_LOGD(TAG, "probe: sendto failed errno=%d", errno);
         close(sock);
         return false;
     }
 
-    /* Wait for response */
+    uint32_t start = now_ms();
     uint8_t reply[512];
     struct sockaddr_in from;
     socklen_t from_len = sizeof(from);
     int n = recvfrom(sock, reply, sizeof(reply), 0,
                      (struct sockaddr *)&from, &from_len);
+    uint32_t rtt = now_ms() - start;
     close(sock);
 
+    if (out_rtt_ms) *out_rtt_ms = rtt;
+
     if (n < 12) {
-        ESP_LOGD(TAG, "probe: no reply (n=%d errno=%d)", n, errno);
         return false;
     }
 
-    /* Verify transaction ID matches */
+    /* Verify transaction ID */
     uint16_t reply_txid = ((uint16_t)reply[0] << 8) | reply[1];
     if (reply_txid != txid) {
-        ESP_LOGD(TAG, "probe: txid mismatch 0x%04X != 0x%04X", reply_txid, txid);
         return false;
     }
 
-    /* Check DNS RCODE (bytes 3, bits 0-3). RCODE 0 = NOERROR */
+    /* Check RCODE */
     uint8_t rcode = reply[3] & 0x0F;
     if (rcode != 0) {
-        ESP_LOGD(TAG, "probe: DNS RCODE=%d (not NOERROR)", rcode);
         return false;
     }
 
-    /* Check that we got at least one answer */
+    /* Check at least one answer */
     uint16_t ancount = ((uint16_t)reply[6] << 8) | reply[7];
     if (ancount == 0) {
-        ESP_LOGD(TAG, "probe: 0 answers in response");
         return false;
     }
 
-    ESP_LOGD(TAG, "probe: upstream OK (txid=0x%04X, answers=%d)", txid, ancount);
+    return true;
+}
+
+/**
+ * Probe task body — runs the blocking DNS probe.
+ * This runs in its own FreeRTOS task so the main loop can continue
+ * sending BNEP keepalives (every 2s) while the probe waits for a
+ * DNS response (which can take 5-20s through Bluetooth PAN).
+ */
+static void probe_task_fn(void *arg)
+{
+    (void)arg;
+    tinypan_ip_info_t ip_info;
+    bool result = false;
+    uint32_t rtt_ms = 0;
+
+    if (pan_manager_get_ip_info(&ip_info) != ESP_OK) {
+        ESP_LOGD(TAG, "probe: no PAN IP info");
+        goto done;
+    }
+
+    uint32_t pan_ip_h = ip_info.ip_addr;
+    uint16_t txid = (uint16_t)(now_ms() & 0xFFFF);
+    if (txid == 0) txid = 1;
+
+    /* Stage 1: Probe 8.8.8.8 directly (fast — bypasses phone's slow
+     * DNS proxy). Should respond in <1s on cellular. */
+    if (probe_single_dns(RESILIENCE_PROBE_DNS_FALLBACK, pan_ip_h,
+                         RESILIENCE_PROBE_TIMEOUT_DIRECT_MS, txid, &rtt_ms)) {
+        ESP_LOGI(TAG, "probe: upstream OK via 8.8.8.8 (rtt=%lu ms)",
+                 (unsigned long)rtt_ms);
+        result = true;
+        goto done;
+    }
+
+    /* Stage 2: Fall back to the phone's DHCP DNS forwarder.
+     * This is slower (Android tethering DNS proxy can take 10+ seconds
+     * due to DNS-over-HTTPS or IPv6-first fallback) but works when
+     * the carrier blocks direct 8.8.8.8 queries. */
+    uint32_t phone_dns = ip_info.dns_server;
+    if (phone_dns == 0 || phone_dns == RESILIENCE_PROBE_DNS_FALLBACK) {
+        ESP_LOGD(TAG, "probe: 8.8.8.8 failed, no fallback DNS available");
+        goto done;
+    }
+
+    uint16_t txid2 = txid ^ 0x55AA;
+    if (txid2 == 0) txid2 = 1;
+
+    if (probe_single_dns(phone_dns, pan_ip_h,
+                         RESILIENCE_PROBE_TIMEOUT_FALLBACK_MS, txid2, &rtt_ms)) {
+        ESP_LOGI(TAG, "probe: upstream OK via phone DNS (rtt=%lu ms, fallback)",
+                 (unsigned long)rtt_ms);
+        result = true;
+        goto done;
+    }
+
+    ESP_LOGD(TAG, "probe: both 8.8.8.8 and phone DNS failed");
+
+done:
+    s_probe_result = result;
+    s_probe_rtt_ms = rtt_ms;
+    s_probe_done = true;
+    s_probe_busy = false;
+    s_probe_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+/**
+ * Start the DNS probe in a separate task (non-blocking).
+ * Returns true if the probe was started, false if one is already running.
+ */
+static bool start_probe(void)
+{
+    if (s_probe_busy) {
+        return false;  /* previous probe still running */
+    }
+    s_probe_busy = true;
+    s_probe_result = false;
+    s_probe_rtt_ms = 0;
+
+    BaseType_t ret = xTaskCreate(probe_task_fn, "probe", 4096, NULL,
+                                 5, &s_probe_task_handle);
+    if (ret != pdPASS) {
+        ESP_LOGW(TAG, "probe: failed to create probe task");
+        s_probe_busy = false;
+        return false;
+    }
     return true;
 }
 
@@ -323,26 +396,25 @@ static void refresh_dns_forward_server(void)
 static void verify_nat_health(void)
 {
     struct netif *pan_netif = pan_manager_get_netif();
-    struct netif *ap_netif = wifi_ap_get_netif();
-    if (!pan_netif || !ap_netif) {
+    if (!pan_netif) {
         return;
     }
 
     /* Check default route */
     if (netif_default != pan_netif) {
-        ESP_LOGW(TAG, "NAT health: default route lost (was %c%c%d, now %s) — restoring",
-                 pan_netif->name[0], pan_netif->name[1], pan_netif->num,
-                 netif_default ? "other" : "NULL");
+        ESP_LOGW(TAG, "NAT health: default route lost — restoring");
         netif_set_default(pan_netif);
     }
 
-    /* Check NAPT on AP netif */
-    if (!ap_netif->napt) {
-        ESP_LOGW(TAG, "NAT health: NAPT disabled on AP netif — re-enabling");
-        if (ip_napt_enable_netif(ap_netif, 1)) {
-            ESP_LOGI(TAG, "NAT health: NAPT re-enabled");
-        } else {
-            ESP_LOGE(TAG, "NAT health: failed to re-enable NAPT");
+    /* Re-enable NAPT on the AP netif only if it's actually disabled.
+     * Blindly calling ip_napt_enable() every cycle re-runs the full
+     * netif_list scan and re-initializes the NAPT table, which is
+     * wasteful and can briefly disrupt active sessions. */
+    if (my_ap_ip != 0 && ap_nat_enabled) {
+        struct netif *ap_netif = wifi_ap_get_netif();
+        if (ap_netif != NULL && !ap_netif->napt) {
+            ESP_LOGW(TAG, "NAT health: NAPT disabled on AP netif — re-enabling");
+            ip_napt_enable_netif(ap_netif, 1);
         }
     }
 }
@@ -460,92 +532,81 @@ void resilience_process(void)
         refresh_dns_forward_server();
     }
 
-    /* ── Upstream connectivity probe ─────────────────────────── */
+    /* Upstream connectivity probe (async, non-blocking) */
     if (s_reconnect_in_progress) {
         if (pan_online) {
-            /* Reconnect completed (PAN came back between calls) — resume probing */
             ESP_LOGI(TAG, "Reconnect completed, resuming probes");
             s_reconnect_in_progress = false;
-            /* fall through to probing below */
         } else {
-            /* Still waiting for reconnect to complete; skip probing */
             return;
         }
     }
 
+    /* If probe task is still running, wait for it */
+    if (s_probe_busy) {
+        return;
+    }
+
+    /* If a probe just completed, process the result */
+    if (s_probe_done) {
+        s_probe_done = false;
+        bool ok = s_probe_result;
+
+        if (ok) {
+            if (s_probe_failures > 0) {
+                ESP_LOGI(TAG, "Upstream probe OK — failures reset (%d -> 0)",
+                         s_probe_failures);
+            }
+            s_probe_failures = 0;
+        } else {
+            s_probe_failures++;
+
+            bool link_alive = bt_link_is_alive();
+            int threshold = link_alive ? RESILIENCE_PROBE_FAIL_THRESHOLD_ALIVE
+                                       : RESILIENCE_PROBE_FAIL_THRESHOLD_DEAD;
+
+            ESP_LOGW(TAG, "Upstream probe FAILED (%d/%d) — BT link %s",
+                     s_probe_failures, threshold,
+                     link_alive ? "ALIVE (cellular dead — patient)" :
+                                  "DEAD (reconnecting aggressively)");
+
+            if (s_probe_failures >= threshold) {
+                if (link_alive) {
+                    ESP_LOGW(TAG, "Upstream unreachable for %lu ms but BT link "
+                             "alive — forcing PAN reconnect to refresh DHCP/routing",
+                             (unsigned long)(s_probe_failures *
+                                             RESILIENCE_PROBE_INTERVAL_MS));
+                } else {
+                    ESP_LOGW(TAG, "Upstream unreachable and BT link dead — "
+                             "forcing PAN reconnect");
+                }
+
+                tinypan_state_t state = tinypan_get_state();
+                if (state != TINYPAN_STATE_IDLE) {
+                    const tinypan_config_t *cfg = tinypan_internal_get_config();
+                    esp_bd_addr_t bda;
+                    if (cfg) {
+                        memcpy(bda, cfg->remote_addr, sizeof(esp_bd_addr_t));
+                        tinypan_stop();
+                        vTaskDelay(pdMS_TO_TICKS(3000));
+                        tinypan_set_remote_addr(bda);
+                        tinypan_start();
+                        s_reconnect_in_progress = true;
+                        ESP_LOGI(TAG, "PAN reconnect initiated");
+                    }
+                }
+                s_probe_failures = 0;
+            }
+        }
+        return;
+    }
+
+    /* Start a new probe if interval has elapsed */
     if (now - s_last_probe_ms < RESILIENCE_PROBE_INTERVAL_MS) {
         return;
     }
     s_last_probe_ms = now;
-
-    bool ok = probe_upstream_dns();
-    if (ok) {
-        if (s_probe_failures > 0) {
-            ESP_LOGI(TAG, "Upstream probe OK — failures reset (%d -> 0)",
-                     s_probe_failures);
-        }
-        s_probe_failures = 0;
-    } else {
-        s_probe_failures++;
-
-        /* Distinguish two failure modes:
-         *
-         * 1. BT link DEAD (no recent BNEP RX): The Bluetooth link
-         *    itself is gone. Reconnect aggressively — there's nothing
-         *    to lose since the link is already dead.
-         *
-         * 2. BT link ALIVE (recent BNEP keepalive RX): The Bluetooth
-         *    link is healthy but the phone has no upstream internet
-         *    (5G dead spot, VPN transition, tower handoff glitch).
-         *    The phone will likely auto-recover cellular on its own.
-         *    Tearing down a healthy BT link to reconnect is
-         *    counterproductive — it takes 20-30s to re-establish
-         *    (L2CAP + BNEP + DHCP) during which clients have ZERO
-         *    connectivity even if 5G just came back. Wait much longer
-         *    (5 minutes at 20s probe interval = 15 failures) before
-         *    forcing a reconnect. */
-        bool link_alive = bt_link_is_alive();
-        int threshold = link_alive ? RESILIENCE_PROBE_FAIL_THRESHOLD_ALIVE
-                                   : RESILIENCE_PROBE_FAIL_THRESHOLD_DEAD;
-
-        ESP_LOGW(TAG, "Upstream probe FAILED (%d/%d) — BT link %s",
-                 s_probe_failures, threshold,
-                 link_alive ? "ALIVE (cellular dead — patient)" :
-                              "DEAD (reconnecting aggressively)");
-
-        if (s_probe_failures >= threshold) {
-            if (link_alive) {
-                ESP_LOGW(TAG, "Upstream unreachable for %lu ms but BT link "
-                         "alive — forcing PAN reconnect to refresh DHCP/routing",
-                         (unsigned long)(s_probe_failures *
-                                         RESILIENCE_PROBE_INTERVAL_MS));
-            } else {
-                ESP_LOGW(TAG, "Upstream unreachable and BT link dead — "
-                         "forcing PAN reconnect");
-            }
-
-            /* Force a full PAN reconnect. This clears all state and
-             * re-establishes DHCP + NAT from scratch, picking up any
-             * DNS server changes on the phone (VPN, etc.). */
-            tinypan_state_t state = tinypan_get_state();
-            if (state != TINYPAN_STATE_IDLE) {
-                /* Get the current remote address before stopping so
-                 * we can reconnect to the same phone. */
-                const tinypan_config_t *cfg = tinypan_internal_get_config();
-                esp_bd_addr_t bda;
-                if (cfg) {
-                    memcpy(bda, cfg->remote_addr, sizeof(esp_bd_addr_t));
-                    tinypan_stop();
-                    vTaskDelay(pdMS_TO_TICKS(1000));  /* brief pause */
-                    tinypan_set_remote_addr(bda);
-                    tinypan_start();
-                    s_reconnect_in_progress = true;
-                    ESP_LOGI(TAG, "PAN reconnect initiated");
-                }
-            }
-            s_probe_failures = 0;
-        }
-    }
+    start_probe();
 }
 
 int resilience_get_probe_failures(void)

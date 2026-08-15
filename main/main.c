@@ -16,6 +16,8 @@
 #include "led_indicator.h"
 #include "console_repl.h"
 #include "resilience.h"
+#include "dhcp_reservations.h"
+#include "router_config.h"
 #include <string.h>
 #include "esp_gap_bt_api.h"
 #include "tinypan.h"
@@ -33,6 +35,10 @@ static bool     s_bt_paused_for_wifi = false;
 static uint32_t s_bt_pause_start_ms  = 0;
 static esp_bd_addr_t s_paused_bt_bda;  /* saved for reconnect */
 static bool     s_has_paused_bt_bda  = false;
+
+/* Resilience watchdog: we set this flag when intentionally disconnecting
+ * BT for WiFi handshake, so the watchdog doesn't interpret it as a link
+ * failure and try to reconnect. */
 
 /* ── LED error tracking ─────────────────────────────────────────── */
 
@@ -111,10 +117,10 @@ static void on_bt_state_change(bt_state_t old_state,
  * Flow:
  * 1. Boot: BT auto-connects, PAN comes online
  * 2. No stations for > 10s → disconnect BT (WiFi gets clear RF)
- * 3. Client auth/assoc succeeds (BT is off) → station joins (AID=1)
+ * 3. Chromebook auth/assoc succeeds (BT is off) → station joins (AID=1)
  * 4. EAPOL handshake completes (STACONNECTED) → reconnect BT
- * 5. BT reconnects, PAN online, client has internet
- * 6. Client disconnects → station count drops to 0 → go to step 2
+ * 5. BT reconnects, PAN online, Chromebook has internet
+ * 6. Chromebook disconnects → station count drops to 0 → go to step 2
  *
  * Safety: if BT is paused for > 120s, reconnect briefly to keep the
  * phone's Bluetooth tethering alive, then disconnect again.
@@ -287,6 +293,17 @@ void app_main(void) {
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    /* Load DHCP reservations from NVS before WiFi AP starts so the
+     * custom dhcpserver can honour them from the first client. */
+    esp_err_t res_err = get_dhcp_reservations();
+    if (res_err == ESP_OK) {
+        ESP_LOGI(TAG, "DHCP reservations loaded from NVS");
+    } else if (res_err == ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGI(TAG, "No DHCP reservations in NVS (first boot)");
+    } else {
+        ESP_LOGW(TAG, "DHCP reservation load failed: %s", esp_err_to_name(res_err));
+    }
 
     /* Start LED indicator — begins with BOOTING pattern (fast blink) */
     ESP_ERROR_CHECK(led_indicator_init());

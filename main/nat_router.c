@@ -24,6 +24,8 @@
 #include "captive_dns.h"
 #include "tinypan_bnep.h"
 #include "lwip/etharp.h"
+#include "router_config.h"
+#include "wifi_config.h"
 
 static const char *TAG = "nat_router";
 
@@ -57,13 +59,14 @@ static void nat_router_teardown(void)
         ESP_LOGI(TAG, "Default route cleared (was PAN netif)");
     }
 
-    /* Disable NAPT on the AP netif — without an upstream link, translating
-     * client traffic just blackholes it and breaks the captive portal. */
-    struct netif *ap_netif = wifi_ap_get_netif();
-    if (ap_netif && ap_netif->napt) {
-        ip_napt_enable_netif(ap_netif, 0);
-        ESP_LOGI(TAG, "NAPT disabled on AP netif");
+    /* Disable NAPT on the AP IP */
+    if (my_ap_ip != 0) {
+        ip_napt_enable(my_ap_ip, 0);
+        ESP_LOGI(TAG, "NAPT disabled on AP IP");
     }
+
+    /* Disable MSS clamping — no PAN upstream to clamp for */
+    ap_mss_clamp = 0;
 
     s_active = false;
     ESP_LOGI(TAG, "NAT router torn down — PAN offline");
@@ -105,20 +108,24 @@ static void on_pan_event(pan_manager_event_t event)
      * Previously NAPT was on PAN (WAN), which caused both paths to be
      * skipped — packets went out with private source IPs and replies
      * were never de-translated. */
-    struct netif *ap_netif = wifi_ap_get_netif();
-    if (!ap_netif) {
-        ESP_LOGE(TAG, "AP netif is NULL — cannot enable NAPT");
-        return;
-    }
-    if (!ip_napt_enable_netif(ap_netif, 1)) {
-        ESP_LOGE(TAG, "ip_napt_enable_netif failed — is the AP netif up?");
-        return;
-    }
-    ESP_LOGI(TAG, "NAPT enabled on AP netif (LAN side)");
+    ip_napt_enable(my_ap_ip, 1);
+    ESP_LOGI(TAG, "NAPT enabled on AP IP (LAN side)");
 
     /* Route all outbound traffic through the PAN interface */
     netif_set_default(pan_netif);
     ESP_LOGI(TAG, "Default route set through PAN netif");
+
+    /* Enable TCP MSS clamping for the BT PAN upstream.
+     * Bluetooth PAN has a lower MTU (~1400) than Ethernet (1500); without
+     * clamping, clients advertise MSS 1460 and large TCP segments get
+     * fragmented or dropped at the PAN link. 1380 leaves headroom for
+     * BNEP + L2CAP headers and matches typical BT PAN MTU. */
+    ap_mss_clamp = 1380;
+    ESP_LOGI(TAG, "TCP MSS clamping enabled at %u for PAN upstream", ap_mss_clamp);
+
+    /* Hook byte counters after NAT is active */
+    extern void init_byte_counter(void);
+    init_byte_counter();
 
     /* Propagate DNS: set captive DNS forward server to phone's DNS.
      * DHCP clients use 192.168.99.1 as DNS (set at init), and the captive
@@ -164,10 +171,14 @@ static void on_pan_event(pan_manager_event_t event)
              pan_netif->flags, pan_netif->mtu);
     ESP_LOGI(TAG, "diag: PAN ip=%s", ip4addr_ntoa(netif_ip4_addr(pan_netif)));
 
-    ESP_LOGI(TAG, "diag: AP netif=%c%c%d up=%d link_up=%d flags=0x%02x napt=%d",
-             ap_netif->name[0], ap_netif->name[1], ap_netif->num,
-             netif_is_up(ap_netif), netif_is_link_up(ap_netif),
-             ap_netif->flags, ap_netif->napt);
+    // Get AP netif for diagnostics
+    struct netif *ap_netif = wifi_ap_get_netif();
+    if (ap_netif) {
+        ESP_LOGI(TAG, "diag: AP netif=%c%c%d up=%d link_up=%d flags=0x%02x",
+                 ap_netif->name[0], ap_netif->name[1], ap_netif->num,
+                 netif_is_up(ap_netif), netif_is_link_up(ap_netif),
+                 ap_netif->flags);
+    }
 
     /* List all netifs to verify both are registered */
     struct netif *n;

@@ -36,4 +36,6 @@ flasher_args.json
 test_logs_*.log
 serial_log*
 
+# Personal / local-only notes and progress files
 notes_do_not_commit.txt
+progress_*.md

@@ -16,9 +16,16 @@ extern "C"
 #define RESILIENCE_PROBE_INTERVAL_MS  20000
 #endif
 
-/** Timeout for each DNS probe (ms). */
-#ifndef RESILIENCE_PROBE_TIMEOUT_MS
-#define RESILIENCE_PROBE_TIMEOUT_MS   5000
+/** Timeout for each DNS probe stage (ms).
+ *  Stage 1 (8.8.8.8 direct): 5s — should respond in <1s on cellular.
+ *  Stage 2 (phone DNS forwarder): 15s — Android tethering DNS proxy
+ *  can take 10+ seconds due to DNS-over-HTTPS or IPv6-first fallback.
+ *  Total worst case: 20s, within the 20s probe interval. */
+#ifndef RESILIENCE_PROBE_TIMEOUT_DIRECT_MS
+#define RESILIENCE_PROBE_TIMEOUT_DIRECT_MS    5000
+#endif
+#ifndef RESILIENCE_PROBE_TIMEOUT_FALLBACK_MS
+#define RESILIENCE_PROBE_TIMEOUT_FALLBACK_MS  15000
 #endif
 
 /** Number of consecutive probe failures before forcing a PAN reconnect
@@ -115,9 +122,8 @@ int resilience_get_probe_failures(void);
  *
  * Called by the WiFi handshake logic when it intentionally disconnects
  * BT to give WiFi uncontested RF access. When true, the resilience
- * watchdog suspends probes and the offline-reboot fallback (it would
- * otherwise interpret the intentional disconnect as a link failure and
- * reboot after 120s).
+ * watchdog suspends probes and reconnect attempts (it would otherwise
+ * interpret the intentional disconnect as a link failure).
  *
  * @param in_progress  true when BT is intentionally disconnected for WiFi
  */

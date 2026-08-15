@@ -15,6 +15,8 @@
 #include "esp_event.h"
 #include "esp_timer.h"
 #include "esp_gap_bt_api.h"
+#include "router_config.h"
+#include "wifi_config.h"
 #include "tinypan.h"
 #include "tinypan_internal.h"
 
@@ -226,6 +228,7 @@ esp_err_t wifi_ap_init(const bridge_ap_config_t *config)
     };
     esp_netif_dhcps_stop(s_ap_netif);
     esp_netif_set_ip_info(s_ap_netif, &ip_info);
+    my_ap_ip = ip_info.ip.addr;  /* Sync global for NAPT API */
     esp_netif_dhcps_start(s_ap_netif);
 
     /* 3. WiFi init */

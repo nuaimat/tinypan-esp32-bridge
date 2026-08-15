@@ -19,6 +19,8 @@
 #include "bt_state.h"
 #include "pan_manager.h"
 #include "wifi_ap.h"
+#include "router_config.h"
+#include "dhcp_reservations.h"
 
 /* ── Module state ──────────────────────────────────────────────────── */
 
@@ -131,18 +133,22 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     }
 
     /* build JSON */
-    char json[256];
+    char json[384];
     int len = snprintf(json, sizeof(json),
         "{"
           "\"bt_connected\":%s,"
           "\"wifi_clients\":%d,"
           "\"uptime\":%lld,"
-          "\"ip\":\"%s\""
+          "\"ip\":\"%s\","
+          "\"bytes_sent\":%llu,"
+          "\"bytes_received\":%llu"
         "}",
         bt_connected ? "true" : "false",
         wifi_clients,
         uptime_sec,
-        ip_str);
+        ip_str,
+        (unsigned long long)get_sta_bytes_sent(),
+        (unsigned long long)get_sta_bytes_received());
 
     if (len < 0 || (size_t)len >= sizeof(json)) {
         httpd_resp_send_500(req);

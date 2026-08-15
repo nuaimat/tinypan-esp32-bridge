@@ -140,7 +140,7 @@ int supervisor_start(void) {
      * a stale HAL_L2CAP_EVENT_DISCONNECTED from supervisor_stop() can
      * arrive during CONNECTING and trigger a spurious reconnect loop. */
     hal_bt_drain_events();
-
+    
     /* Begin connecting */
     set_state(TINYPAN_STATE_CONNECTING);
     
@@ -432,20 +432,20 @@ void supervisor_on_l2cap_event(int event, int status) {
             if (transport_tx && transport_tx->flush_queues) {
                 transport_tx->flush_queues();
             }
-            
+
             /* Link Status: Set link down on disconnect to notify lwIP stack */
             tinypan_netif_set_link(false);
 
-            /* Internal State: Clear IP information on disconnect to ensure 
+            /* Internal State: Clear IP information on disconnect to ensure
              * tinypan_is_online() reflects current link status. */
             tinypan_internal_clear_ip();
 
-            /* Explicitly stop DHCP to prevent split-brain where lwIP 
+            /* Explicitly stop DHCP to prevent split-brain where lwIP
              * continues to background-poll for a lease on a dead link. */
             tinypan_netif_stop_dhcp();
 #endif
-            
-            if (s_state == TINYPAN_STATE_ONLINE || 
+
+            if (s_state == TINYPAN_STATE_ONLINE ||
                 s_state == TINYPAN_STATE_DHCP ||
                 s_state == TINYPAN_STATE_BNEP_SETUP ||
                 s_state == TINYPAN_STATE_BNEP_FILTER_WAIT) {

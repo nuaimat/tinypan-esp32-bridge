@@ -50,6 +50,8 @@
 #include "captive_dns.h"
 #include "tinypan.h"
 #include "tinypan_lwip_netif.h"
+#include "router_config.h"
+#include "dhcp_reservations.h"
 
 static const char *TAG = "console";
 
@@ -97,6 +99,7 @@ static void cmd_help(void)
     send_str("  reconnect       — force PAN reconnect\r\n");
     send_str("  dns             — show DNS forward server\r\n");
     send_str("  wifi            — WiFi AP info + stations\r\n");
+    send_str("  clients         — list connected clients (DHCP leases)\r\n");
     send_str("  bt              — BT state + bonded devices\r\n");
     send_str("  keepalive <ms>  — set BNEP keepalive interval\r\n");
     send_str("  qos <hex>       — set BT QoS poll interval\r\n");
@@ -121,6 +124,32 @@ static void cmd_status(void)
 
     int clients = wifi_ap_get_connected_clients();
     send_fmt("WiFi clients: %d\r\n", clients);
+
+    /* Per-client detail (DHCP leases + reservations) */
+    connected_client_t cinfo[AP_MAX_CONNECTIONS];
+    int n = get_connected_clients(cinfo, AP_MAX_CONNECTIONS);
+    if (n > 0) {
+        send_str("  MAC                  IP              Name\r\n");
+        for (int i = 0; i < n; i++) {
+            const char *name = cinfo[i].name[0] ? cinfo[i].name : "-";
+            if (cinfo[i].has_ip) {
+                ip4_addr_t a; a.addr = cinfo[i].ip;
+                send_fmt("  %02X:%02X:%02X:%02X:%02X:%02X  %-15s %s\r\n",
+                    cinfo[i].mac[0], cinfo[i].mac[1], cinfo[i].mac[2],
+                    cinfo[i].mac[3], cinfo[i].mac[4], cinfo[i].mac[5],
+                    ip4addr_ntoa(&a), name);
+            } else {
+                send_fmt("  %02X:%02X:%02X:%02X:%02X:%02X  (no IP)         %s\r\n",
+                    cinfo[i].mac[0], cinfo[i].mac[1], cinfo[i].mac[2],
+                    cinfo[i].mac[3], cinfo[i].mac[4], cinfo[i].mac[5], name);
+            }
+        }
+    }
+
+    /* WAN byte counters (PAN upstream) */
+    send_fmt("WAN bytes: sent=%llu recv=%llu\r\n",
+        (unsigned long long)get_sta_bytes_sent(),
+        (unsigned long long)get_sta_bytes_received());
     send_str("\r\n");
 }
 
@@ -296,6 +325,33 @@ static void cmd_wifi(void)
     send_str("\r\n");
 }
 
+static void cmd_clients(void)
+{
+    send_str("\r\nConnected clients:\r\n");
+    connected_client_t cinfo[AP_MAX_CONNECTIONS];
+    int n = get_connected_clients(cinfo, AP_MAX_CONNECTIONS);
+    if (n == 0) {
+        send_str("  (none)\r\n");
+    } else {
+        send_str("  MAC                  IP              Name\r\n");
+        for (int i = 0; i < n; i++) {
+            const char *name = cinfo[i].name[0] ? cinfo[i].name : "-";
+            if (cinfo[i].has_ip) {
+                ip4_addr_t a; a.addr = cinfo[i].ip;
+                send_fmt("  %02X:%02X:%02X:%02X:%02X:%02X  %-15s %s\r\n",
+                    cinfo[i].mac[0], cinfo[i].mac[1], cinfo[i].mac[2],
+                    cinfo[i].mac[3], cinfo[i].mac[4], cinfo[i].mac[5],
+                    ip4addr_ntoa(&a), name);
+            } else {
+                send_fmt("  %02X:%02X:%02X:%02X:%02X:%02X  (no IP)         %s\r\n",
+                    cinfo[i].mac[0], cinfo[i].mac[1], cinfo[i].mac[2],
+                    cinfo[i].mac[3], cinfo[i].mac[4], cinfo[i].mac[5], name);
+            }
+        }
+    }
+    send_str("\r\n");
+}
+
 static void cmd_bt(void)
 {
     send_str("\r\nBluetooth:\r\n");
@@ -371,6 +427,7 @@ static void process_cmd(const char *line)
     else if (strcasecmp(cmd, "reconnect") == 0) cmd_reconnect();
     else if (strcasecmp(cmd, "dns") == 0)       cmd_dns();
     else if (strcasecmp(cmd, "wifi") == 0)      cmd_wifi();
+    else if (strcasecmp(cmd, "clients") == 0)   cmd_clients();
     else if (strcasecmp(cmd, "bt") == 0)        cmd_bt();
     else if (strcasecmp(cmd, "keepalive") == 0) cmd_keepalive(arg);
     else if (strcasecmp(cmd, "qos") == 0)       cmd_qos(arg);

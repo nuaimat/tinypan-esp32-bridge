@@ -268,6 +268,11 @@ Use the web UI (Settings panel) or run `idf.py menuconfig` → TinyPAN Bridge Co
 | TinyPAN wrapper | `main/pan_manager.c` |
 | WiFi softAP | `main/wifi_ap.c` |
 | lwIP NAT/router | `main/nat_router.c` |
+| Netif hooks (NAPT) | `main/netif_hooks.c` |
+| Router globals | `main/router_globals.c` |
+| Custom DHCP server | `components/dhcpserver/` |
+| DHCP reservation manager | `main/dhcp_manager.c` |
+| NVS config persistence | `main/nvs_config.c` |
 | HTTP server + REST API | `main/http_server.c` |
 | Captive portal DNS | `main/captive_dns.c` |
 | Resilience watchdog | `main/resilience.c` |
@@ -407,4 +412,5 @@ MIT — see [LICENSE](LICENSE). The upstream [TinyPAN](https://github.com/Akhil-
 ## Acknowledgements
 
 - [TinyPAN](https://github.com/Akhil-Chaturvedi/TinyPAN) — Bluetooth PAN (BNEP/L2CAP) stack for ESP32
-- [martin-ger/esp32_nat_router](https://github.com/martin-ger/esp32_nat_router) — lwIP NAPT (Network Address Port Translation) implementation used for NAT routing. The `lwip_napt.h` API and patched lwIP NAPT support are derived from this project (MIT licensed).
+- [martin-ger/esp32_nat_router](https://github.com/martin-ger/esp32_nat_router) — lwIP NAPT (Network Address Port Translation) implementation, netif hooks, and router config patterns. The `lwip_napt.h` API, `netif_hooks.c`, `router_globals.c`, and `nvs_config.c` are derived from this project (MIT licensed).
+- [Espressif ESP-IDF](https://github.com/espressif/esp-idf) — the custom DHCP server in `components/dhcpserver/` is adapted from the ESP-IDF dhcpserver component (Apache-2.0).

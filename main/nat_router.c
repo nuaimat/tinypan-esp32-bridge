@@ -6,6 +6,9 @@
  * netif (the LAN side) and sets the PAN netif as the lwIP default route.
  * WiFi clients on the SoftAP subnet can then reach the internet
  * through the phone's Bluetooth PAN connection.
+ *
+ * NAPT implementation adapted from martin-ger/esp32_nat_router (MIT).
+ * See: https://github.com/martin-ger/esp32_nat_router
  */
 
 #include "nat_router.h"

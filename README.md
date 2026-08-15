@@ -403,3 +403,8 @@ Contributions are welcome! Please open an issue first to discuss what you'd like
 ## License
 
 MIT — see [LICENSE](LICENSE). The upstream [TinyPAN](https://github.com/Akhil-Chaturvedi/TinyPAN) library is also MIT licensed.
+
+## Acknowledgements
+
+- [TinyPAN](https://github.com/Akhil-Chaturvedi/TinyPAN) — Bluetooth PAN (BNEP/L2CAP) stack for ESP32
+- [martin-ger/esp32_nat_router](https://github.com/martin-ger/esp32_nat_router) — lwIP NAPT (Network Address Port Translation) implementation used for NAT routing. The `lwip_napt.h` API and patched lwIP NAPT support are derived from this project (MIT licensed).

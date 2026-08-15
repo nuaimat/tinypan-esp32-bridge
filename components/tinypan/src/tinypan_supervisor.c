@@ -409,6 +409,16 @@ void supervisor_on_l2cap_event(int event, int status) {
         case HAL_L2CAP_EVENT_DISCONNECTED:
             TINYPAN_LOG_INFO("L2CAP disconnected: status=%d, supervisor_state=%s",
                              status, tinypan_state_to_string(s_state));
+
+            /* Stale disconnect race: If we just initiated a new connection
+             * (CONNECTING state) and the BT stack reports it's already
+             * connected, this disconnect event is from the PREVIOUS
+             * session. Ignore it — the new connection is live. */
+            if (s_state == TINYPAN_STATE_CONNECTING && hal_bt_is_connected()) {
+                TINYPAN_LOG_WARN("Ignoring stale L2CAP disconnect — new connection already active");
+                break;
+            }
+
             {
                 const tinypan_transport_t* transport = tinypan_transport_get();
                 if (transport && transport->on_disconnected) {

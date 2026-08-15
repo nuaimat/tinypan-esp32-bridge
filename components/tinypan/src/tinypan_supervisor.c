@@ -135,7 +135,12 @@ int supervisor_start(void) {
     s_reconnect_attempts = 0;
     s_setup_retries = 0;
     s_dhcp_retries = 0;
-    
+
+    /* Drain stale HAL events from any previous session. Without this,
+     * a stale HAL_L2CAP_EVENT_DISCONNECTED from supervisor_stop() can
+     * arrive during CONNECTING and trigger a spurious reconnect loop. */
+    hal_bt_drain_events();
+
     /* Begin connecting */
     set_state(TINYPAN_STATE_CONNECTING);
     
@@ -331,6 +336,10 @@ void supervisor_process(void) {
                         s_reconnect_attempts++;
                         TINYPAN_LOG_INFO("Reconnecting (attempt %u)...",
                                          (unsigned int)s_reconnect_attempts);
+
+                        /* Drain stale events before reconnecting */
+                        hal_bt_drain_events();
+
                         set_state(TINYPAN_STATE_CONNECTING);
                         s_setup_retries = 0;
 

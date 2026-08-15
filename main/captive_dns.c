@@ -381,8 +381,9 @@ void captive_dns_set_passthrough(bool enabled)
                     return;
                 }
                 /* Set receive timeout so recvfrom doesn't block too long.
-                 * Short timeout to avoid queue buildup during DNS bursts. */
-                struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+                 * 5s allows for BT PAN latency (typically 80-300ms via
+                 * 8.8.8.8, but give margin for cellular RTT). */
+                struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
                 setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
                 s_fwd_sock = sock;
                 /* Start forward task (only once, only with a valid queue) */
@@ -415,8 +416,24 @@ void captive_dns_set_forward_server(uint32_t dns_addr)
         s_fwd_dns_server.addr = 0;
         return;
     }
-    s_fwd_dns_server.addr = dns_addr;
-    ESP_LOGI(TAG, "Forward DNS server set to %d.%d.%d.%d",
+
+    /* Use 8.8.8.8 as the primary forward DNS server instead of the
+     * phone's DHCP-provided DNS (typically 10.x.x.x). The phone's
+     * tethering DNS proxy is extremely slow (10-12s RTT due to
+     * Android DNS-over-HTTPS or IPv6-first fallback), causing client
+     * connectivity checks (Chromebook, iOS, Android captive portal
+     * detection) to time out and report "unknown failure".
+     *
+     * 8.8.8.8 is forwarded as a plain IP packet by the phone to the
+     * cellular network, bypassing the slow DNS proxy entirely. Typical
+     * RTT is 80-200ms vs 10-12 seconds.
+     *
+     * The phone's DNS is kept as a fallback for VPN scenarios where
+     * 8.8.8.8 might be blocked, but the primary path is 8.8.8.8. */
+    uint32_t google_dns = htonl(0x08080808);  /* 8.8.8.8 in network order */
+    s_fwd_dns_server.addr = google_dns;
+
+    ESP_LOGI(TAG, "Forward DNS server set to 8.8.8.8 (phone DNS %d.%d.%d.%d as fallback)",
              (int)(dns_addr & 0xFF), (int)((dns_addr >> 8) & 0xFF),
              (int)((dns_addr >> 16) & 0xFF), (int)((dns_addr >> 24) & 0xFF));
 }

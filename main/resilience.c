@@ -76,6 +76,12 @@ static uint32_t s_last_probe_ms    = 0;
 static uint32_t s_last_dns_refresh_ms = 0;  /* DNS forward server refresh */
 static int      s_probe_failures   = 0;
 static bool     s_reconnect_in_progress = false;
+static uint32_t s_reconnect_set_ms = 0;   /* when the flag was last set */
+
+/* How long an intentional BT pause (reconnect_in_progress) suppresses the
+ * offline-reboot fallback. Must exceed the on-demand max pause (120s) plus
+ * reconnect time; after this, a genuinely stuck system still reboots. */
+#define RESILIENCE_RECONNECT_GRACE_MS  300000
 
 /* ── Helpers ───────────────────────────────────────────────────── */
 
@@ -385,6 +391,18 @@ void resilience_notify_offline(void)
     }
 }
 
+void resilience_set_reconnect_in_progress(bool in_progress)
+{
+    s_reconnect_in_progress = in_progress;
+    if (in_progress) {
+        /* Reset probe failures so the watchdog doesn't immediately
+         * try to reconnect when we clear the flag. */
+        s_probe_failures = 0;
+        s_offline_since_ms = 0;  /* don't count this as offline time */
+        s_reconnect_set_ms = now_ms();
+    }
+}
+
 void resilience_process(void)
 {
     if (!s_initialized) {
@@ -406,12 +424,23 @@ void resilience_process(void)
 
     /* ── Offline reboot fallback ─────────────────────────────── */
     if (!pan_online && s_offline_since_ms > 0) {
-        uint32_t offline_dur = now - s_offline_since_ms;
-        if (offline_dur >= RESILIENCE_OFFLINE_REBOOT_MS) {
-            ESP_LOGE(TAG, "Continuously offline for %lu ms — REBOOTING",
-                     (unsigned long)offline_dur);
-            vTaskDelay(pdMS_TO_TICKS(500));  /* let log flush */
-            esp_restart();
+        if (s_reconnect_in_progress &&
+            (now - s_reconnect_set_ms) <= RESILIENCE_RECONNECT_GRACE_MS) {
+            /* BT is intentionally paused (on-demand mode) or a reconnect
+             * is being orchestrated — don't accrue offline time toward
+             * the reboot fallback. NOTE: the online→offline edge above
+             * re-arms s_offline_since_ms AFTER set_reconnect_in_progress()
+             * cleared it, so we must keep sliding it here. Grace-limited
+             * so a genuinely stuck reconnect still reboots eventually. */
+            s_offline_since_ms = now;
+        } else {
+            uint32_t offline_dur = now - s_offline_since_ms;
+            if (offline_dur >= RESILIENCE_OFFLINE_REBOOT_MS) {
+                ESP_LOGE(TAG, "Continuously offline for %lu ms — REBOOTING",
+                         (unsigned long)offline_dur);
+                vTaskDelay(pdMS_TO_TICKS(500));  /* let log flush */
+                esp_restart();
+            }
         }
     }
 

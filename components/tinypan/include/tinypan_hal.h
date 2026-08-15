@@ -102,6 +102,17 @@ int hal_bt_init(void);
 void hal_bt_poll(void);
 
 /**
+ * @brief Drain all pending events from the HAL event queue without
+ *        dispatching them to callbacks.
+ *
+ * Called before starting a new L2CAP connection to discard stale
+ * HAL_L2CAP_EVENT_DISCONNECTED events from a previous session.
+ * Without this, the supervisor receives a stale disconnect during
+ * CONNECTING and enters a spurious reconnect loop.
+ */
+void hal_bt_drain_events(void);
+
+/**
  * @brief De-initialize the Bluetooth stack
  * 
  * Called during tinypan_deinit(). Should clean up all Bluetooth resources.

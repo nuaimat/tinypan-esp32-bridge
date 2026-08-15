@@ -66,6 +66,7 @@ static bt_state_change_cb_t    s_change_cb      = NULL;
 static TimerHandle_t           s_backoff_timer  = NULL;
 static esp_bd_addr_t           s_reconnect_bda  = {0};
 static int                     s_retry_count    = 0;
+static bool                    s_reconnect_suppressed = false;
 
 /* ── State / event name helpers ────────────────────────────────── */
 
@@ -278,8 +279,13 @@ esp_err_t bt_state_machine_event(bt_state_event_t event,
     /* Unexpected disconnect from an active connection — backoff */
     if (event == BT_EVT_ACL_DISCONNECTED &&
         (old == BT_STATE_CONNECTED || old == BT_STATE_PAIRING)) {
-        s_retry_count++;
-        schedule_backoff();
+        if (s_reconnect_suppressed) {
+            ESP_LOGI(TAG, "ACL disconnected (intentional) — "
+                     "auto-reconnect suppressed");
+        } else {
+            s_retry_count++;
+            schedule_backoff();
+        }
     }
 
     /* Notify state-change listener */
@@ -313,4 +319,21 @@ bool bt_state_backoff_pending(void)
 {
     return (s_backoff_timer &&
             xTimerIsTimerActive(s_backoff_timer) == pdTRUE);
+}
+
+void bt_state_set_reconnect_suppressed(bool suppressed)
+{
+    if (s_reconnect_suppressed == suppressed) {
+        return;
+    }
+    s_reconnect_suppressed = suppressed;
+    ESP_LOGI(TAG, "Auto-reconnect %s",
+             suppressed ? "suppressed (intentional BT pause)" : "re-enabled");
+    if (suppressed) {
+        /* Drop anything already queued so a pending backoff doesn't
+         * fire after the intentional disconnect. */
+        bt_state_cancel_backoff();
+        s_reconnect_pending = false;
+        s_retry_count = 0;
+    }
 }

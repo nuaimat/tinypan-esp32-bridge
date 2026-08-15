@@ -18,8 +18,21 @@
 #include "resilience.h"
 #include <string.h>
 #include "esp_gap_bt_api.h"
+#include "tinypan.h"
+#include "tinypan_internal.h"
 
 static const char *TAG = "tinypan_bridge";
+
+/* ── BT pause for WiFi handshake ───────────────────────────────── */
+/* When a WiFi station tries to join, the EAPOL 4-way handshake needs
+ * uncontested RF access. BT coexistence measures (PREFER_WIFI, PS_NONE,
+ * QoS) are not enough for some devices (Chromebooks with 4s EAPOL
+ * timeout). The nuclear option: temporarily disconnect the BT ACL link
+ * to give WiFi 100% RF access, then reconnect after the handshake. */
+static bool     s_bt_paused_for_wifi = false;
+static uint32_t s_bt_pause_start_ms  = 0;
+static esp_bd_addr_t s_paused_bt_bda;  /* saved for reconnect */
+static bool     s_has_paused_bt_bda  = false;
 
 /* ── LED error tracking ─────────────────────────────────────────── */
 
@@ -84,19 +97,92 @@ static void on_bt_state_change(bt_state_t old_state,
 
 /* ── Station join/leave polling ─────────────────────────────────── */
 
-/**
- * Poll the driver station list to detect joins/leaves. The
- * WIFI_EVENT_AP_STACONNECTED / AP_STADISCONNECTED events never reach the
- * event handler on this build (only boot events arrive), so the
- * reason-15 BT-pause mitigation never engaged. A station count change
- * means either a new station mid-EAPOL (join) or a failed handshake
- * (leave, with a retry typically following within seconds) — both cases
- * benefit from pausing BT keepalive to give EAPOL uncontested RF.
+/* BT on-demand mode:
+ *
+ * The ESP32 shares a single antenna between BT and WiFi. Even with
+ * ESP_COEX_PREFER_WIFI, BT BNEP keepalives (every 2s) steal RF airtime
+ * from WiFi. This causes 802.11 auth/assoc and EAPOL handshake failures
+ * for devices with strict timeouts (Chromebooks).
+ *
+ * Solution: disconnect BT whenever no WiFi stations are connected. This
+ * gives WiFi 100% RF access for clients to authenticate and associate.
+ * BT is reconnected only after a station completes the EAPOL handshake.
+ *
+ * Flow:
+ * 1. Boot: BT auto-connects, PAN comes online
+ * 2. No stations for > 10s → disconnect BT (WiFi gets clear RF)
+ * 3. Client auth/assoc succeeds (BT is off) → station joins (AID=1)
+ * 4. EAPOL handshake completes (STACONNECTED) → reconnect BT
+ * 5. BT reconnects, PAN online, client has internet
+ * 6. Client disconnects → station count drops to 0 → go to step 2
+ *
+ * Safety: if BT is paused for > 120s, reconnect briefly to keep the
+ * phone's Bluetooth tethering alive, then disconnect again.
  */
+
+#define BT_ONDEMAND_NO_STA_GRACE_MS   10000   /* disconnect BT after 10s with no stations */
+#define BT_ONDEMAND_MAX_PAUSE_MS      120000  /* reconnect BT after 120s to keep tethering alive */
+#define BT_RECONNECT_DELAY_MS         3000    /* delay between stop() and start() to drain stale L2CAP events */
+
+static void save_bt_bda_for_reconnect(void)
+{
+    const tinypan_config_t *cfg = tinypan_internal_get_config();
+    if (cfg && (cfg->remote_addr[0] || cfg->remote_addr[5])) {
+        memcpy(s_paused_bt_bda, cfg->remote_addr, sizeof(esp_bd_addr_t));
+        s_has_paused_bt_bda = true;
+    }
+}
+
+static void disconnect_bt_for_wifi(const char *reason)
+{
+    tinypan_state_t bt_state = tinypan_get_state();
+    if (bt_state == TINYPAN_STATE_IDLE || bt_state == TINYPAN_STATE_CONNECTING) {
+        return;  /* already disconnected or connecting — nothing to do */
+    }
+    save_bt_bda_for_reconnect();
+    ESP_LOGI(TAG, "Disconnecting BT (state=%s) — %s",
+             tinypan_state_to_string(bt_state), reason);
+    /* Tell the bt_state machine this disconnect is intentional BEFORE
+     * stopping — the ACL_DISCONNECTED event arrives asynchronously
+     * several seconds after tinypan_stop() (the LM keeps the ACL up
+     * briefly). Without this, bt_state schedules its own backoff
+     * reconnect 5s later, defeating the whole on-demand pause. */
+    bt_state_set_reconnect_suppressed(true);
+    tinypan_stop();
+    s_bt_paused_for_wifi = true;
+    s_bt_pause_start_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    resilience_set_reconnect_in_progress(true);
+}
+
+static void reconnect_bt(void)
+{
+    if (!s_has_paused_bt_bda) {
+        ESP_LOGW(TAG, "Cannot reconnect BT — no saved BDA");
+        s_bt_paused_for_wifi = false;
+        bt_state_set_reconnect_suppressed(false);
+        return;
+    }
+    ESP_LOGI(TAG, "Reconnecting BT to saved BDA");
+    tinypan_set_remote_addr(s_paused_bt_bda);
+    /* Delay to let stale L2CAP disconnect callbacks drain before starting
+     * a new connection. Without this, the supervisor gets a stale disconnect
+     * during CONNECTING and enters a reconnect loop. */
+    vTaskDelay(pdMS_TO_TICKS(BT_RECONNECT_DELAY_MS));
+    tinypan_start();
+    s_bt_paused_for_wifi = false;
+    /* Re-enable bt_state auto-reconnect now that BT is intentionally
+     * back — future ACL drops are genuine link failures again. */
+    bt_state_set_reconnect_suppressed(false);
+    /* resilience_set_reconnect_in_progress(false) will be called
+     * by resilience_notify_online() when PAN comes back up. */
+}
+
 static void poll_station_changes(void)
 {
     static uint32_t s_last_check_ms = 0;
     static int      s_last_count = 0;
+    static uint32_t s_no_stations_since_ms = 0;  /* 0 = not tracking */
+    static bool     s_ondemand_active = false;   /* set true after boot grace period */
 
     uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
     if (now - s_last_check_ms < 250) {
@@ -104,15 +190,86 @@ static void poll_station_changes(void)
     }
     s_last_check_ms = now;
 
+    /* Enable BT on-demand mode 30s after boot (gives BT time to connect) */
+    if (!s_ondemand_active && now > 30000) {
+        s_ondemand_active = true;
+        s_no_stations_since_ms = now;
+        ESP_LOGI(TAG, "BT on-demand mode active — will disconnect BT when no WiFi stations");
+    }
+
     int n = wifi_ap_get_connected_clients();
     if (n < 0) {
         return;  /* AP not running / query failed — keep previous state */
     }
+
     if (n != s_last_count) {
-        ESP_LOGI(TAG, "WiFi station count changed %d -> %d — pausing BT keepalive for 6s",
-                 s_last_count, n);
-        wifi_ap_bt_pause(6000);
+        if (n > s_last_count) {
+            /* Station joining — need BT off for auth/assoc + EAPOL */
+            ESP_LOGI(TAG, "WiFi station joining (%d -> %d)", s_last_count, n);
+            s_no_stations_since_ms = 0;  /* cancel no-stations timer */
+
+            if (!s_bt_paused_for_wifi) {
+                /* BT is still connected — disconnect it now */
+                disconnect_bt_for_wifi("WiFi station joining");
+            }
+            /* If BT is already paused (on-demand mode), keep it paused
+             * for the EAPOL handshake */
+
+            wifi_ap_boost_wifi_for_handshake(15000);
+            wifi_ap_bt_pause(15000);
+        } else {
+            /* Station left — start no-stations timer */
+            ESP_LOGI(TAG, "WiFi station left (%d -> %d)", s_last_count, n);
+            if (s_bt_paused_for_wifi) {
+                /* BT was paused for handshake — keep it paused.
+                 * The no-stations timer will handle reconnection. */
+                ESP_LOGI(TAG, "Station left, BT still paused — will reconnect via on-demand timer");
+            }
+            if (s_ondemand_active) {
+                s_no_stations_since_ms = now;
+            }
+            wifi_ap_bt_pause(6000);  /* brief BT pause for retry */
+        }
         s_last_count = n;
+    }
+
+    /* Check if the WiFi boost window has expired */
+    wifi_ap_poll_handshake_timeout();
+
+    /* If BT is paused and a station completed the handshake, reconnect BT */
+    if (s_bt_paused_for_wifi && n > 0 && wifi_ap_check_handshake_completed()) {
+        ESP_LOGI(TAG, "WiFi handshake completed — reconnecting BT");
+        reconnect_bt();
+    }
+
+    /* BT on-demand: no stations for > grace period → disconnect BT */
+    if (s_ondemand_active && n == 0 && !s_bt_paused_for_wifi &&
+        s_no_stations_since_ms > 0 &&
+        (now - s_no_stations_since_ms) > BT_ONDEMAND_NO_STA_GRACE_MS) {
+        disconnect_bt_for_wifi("no WiFi stations (on-demand mode)");
+        s_no_stations_since_ms = 0;  /* stop tracking until BT reconnects */
+    }
+
+    /* Safety: if BT has been paused for > max pause, reconnect to keep
+     * phone tethering alive. The no-stations timer will disconnect again
+     * after the grace period if still no stations.
+     *
+     * NOTE: use a FRESH timestamp and a signed diff here. The `now`
+     * captured at the top of this function is stale by the time
+     * disconnect_bt_for_wifi() (above) finishes — tinypan_stop() takes
+     * ~50-100ms — so `now < s_bt_pause_start_ms` and an unsigned
+     * subtraction underflows to ~4.29e9, firing this timeout instantly
+     * and causing a BT disconnect/reconnect churn loop every ~13s. */
+    if (s_bt_paused_for_wifi) {
+        uint32_t now_fresh = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        if ((int32_t)(now_fresh - s_bt_pause_start_ms) > (int32_t)BT_ONDEMAND_MAX_PAUSE_MS) {
+            ESP_LOGW(TAG, "BT pause timeout (%ds) — reconnecting to keep tethering alive",
+                     (int)(BT_ONDEMAND_MAX_PAUSE_MS / 1000));
+            reconnect_bt();
+            if (s_ondemand_active) {
+                s_no_stations_since_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            }
+        }
     }
 }
 

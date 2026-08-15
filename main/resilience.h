@@ -110,6 +110,19 @@ void resilience_notify_offline(void);
  */
 int resilience_get_probe_failures(void);
 
+/**
+ * @brief Set the reconnect-in-progress flag.
+ *
+ * Called by the WiFi handshake logic when it intentionally disconnects
+ * BT to give WiFi uncontested RF access. When true, the resilience
+ * watchdog suspends probes and the offline-reboot fallback (it would
+ * otherwise interpret the intentional disconnect as a link failure and
+ * reboot after 120s).
+ *
+ * @param in_progress  true when BT is intentionally disconnected for WiFi
+ */
+void resilience_set_reconnect_in_progress(bool in_progress);
+
 #ifdef __cplusplus
 }
 #endif

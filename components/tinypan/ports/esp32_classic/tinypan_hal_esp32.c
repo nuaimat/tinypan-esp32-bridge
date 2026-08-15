@@ -455,7 +455,7 @@ void hal_bt_poll(void) {
         }
     }
 
-    /* Fire deferred completion events (Breaks recursion loop from app thread) */
+    /* Fire deferred completion events (Breaks recursion loop from app task) */
     if (s_tx_complete_pending) {
         s_tx_complete_pending = false;
         if (s_event_cb) {
@@ -471,6 +471,25 @@ void hal_bt_poll(void) {
             s_recv_cb(s_rx_poll_temp_buf, (uint16_t)rx_len, s_recv_cb_data);
         }
     }
+}
+
+void hal_bt_drain_events(void) {
+    if (!s_hal_initialized) return;
+    if (!s_event_queue) return;
+
+    esp_event_msg_t evt_msg;
+    int drained = 0;
+    while (xQueueReceive(s_event_queue, &evt_msg, 0) == pdTRUE) {
+        drained++;
+        ESP_LOGD(TAG, "Drained stale HAL event: id=%d, status=%d",
+                 evt_msg.event_id, evt_msg.status);
+    }
+    if (drained > 0) {
+        ESP_LOGI(TAG, "Drained %d stale HAL event(s) before reconnect", drained);
+    }
+
+    /* Also clear the deferred TX complete flag */
+    s_tx_complete_pending = false;
 }
 
 /* ============================================================================

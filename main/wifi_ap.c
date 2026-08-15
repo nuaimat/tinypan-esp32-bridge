@@ -14,6 +14,9 @@
 #include "wifi_ap.h"
 #include "esp_event.h"
 #include "esp_timer.h"
+#include "esp_gap_bt_api.h"
+#include "tinypan.h"
+#include "tinypan_internal.h"
 
 static const char *TAG = "wifi_ap";
 
@@ -38,10 +41,22 @@ static bool          s_running = false;
 
 /* BT keepalive pause: set when WiFi station handshake fails (reason 15),
  * cleared when station connects. BNEP transport checks this before sending
- * keepalive to give WiFi uncontested RF during EAPOL retry. */
+ * keepalive to give WiFi uncontested RF during EAPOL retry.
+ *
+ * WiFi PS boost: when a station is trying to join, temporarily switch
+ * WiFi to WIFI_PS_NONE (maximum airtime) so the EAPOL 4-way handshake
+ * can complete despite BT active-mode competition. Restored to
+ * WIFI_PS_MIN_MODEM after the handshake completes or times out. */
 static volatile int64_t s_bt_pause_until_ms = 0;
+static volatile int64_t s_wifi_boost_until_ms = 0;
+static volatile bool    s_wifi_boosted = false;
+static volatile bool    s_handshake_completed = false;  /* set by STACONNECTED event */
 
 #define WIFI_AP_BT_PAUSE_MS  10000
+#define WIFI_AP_BOOST_MS     12000  /* covers EAPOL + retry window */
+
+/* Forward declaration */
+static void wifi_ap_restore_wifi_ps(void);
 
 static void wifi_ap_event_handler(void *arg, esp_event_base_t event_base,
                                    int32_t event_id, void *event_data)
@@ -54,6 +69,8 @@ static void wifi_ap_event_handler(void *arg, esp_event_base_t event_base,
                  event->mac[0], event->mac[1], event->mac[2],
                  event->mac[3], event->mac[4], event->mac[5], event->aid);
         s_bt_pause_until_ms = 0;
+        s_handshake_completed = true;  /* signal BT reconnect in main loop */
+        wifi_ap_restore_wifi_ps();  /* handshake done — restore BT coexistence */
     } else if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
         wifi_event_ap_stadisconnected_t *event = (wifi_event_ap_stadisconnected_t *)event_data;
         ESP_LOGW(TAG, "Station disconnected: %02x:%02x:%02x:%02x:%02x:%02x, AID=%d, reason=%d",
@@ -84,6 +101,71 @@ void wifi_ap_bt_pause(uint32_t duration_ms)
 {
     int64_t now = esp_timer_get_time() / 1000;
     s_bt_pause_until_ms = now + duration_ms;
+}
+
+void wifi_ap_boost_wifi_for_handshake(uint32_t duration_ms)
+{
+    int64_t now = esp_timer_get_time() / 1000;
+    s_wifi_boost_until_ms = now + duration_ms;
+
+    if (!s_wifi_boosted) {
+        s_wifi_boosted = true;
+        /* Boost WiFi airtime for EAPOL 4-way handshake:
+         *
+         * 1. WIFI_PS_NONE — WiFi radio never sleeps
+         * 2. BT QoS poll interval to maximum (0xFFFF = ~41s) — phone
+         *    polls us almost never, giving WiFi near-exclusive RF access
+         *
+         * Coex preference is already PREFER_WIFI (set permanently at init).
+         * BT keepalive pause is handled by the caller. */
+        esp_wifi_set_ps(WIFI_PS_NONE);
+
+        /* Set BT QoS poll to maximum — 0xFFFF * 0.625ms = ~41 seconds.
+         * The phone (master) should honor this and poll very infrequently,
+         * giving WiFi nearly uncontested RF access for the handshake. */
+        const tinypan_config_t *cfg = tinypan_internal_get_config();
+        if (cfg && (cfg->remote_addr[0] || cfg->remote_addr[5])) {
+            esp_bt_gap_set_qos(cfg->remote_addr, 0xFFFF);
+        }
+
+        ESP_LOGI(TAG, "WiFi PS -> NONE + BT QoS 0xFFFF for handshake (%lus)",
+                 (unsigned long)(duration_ms / 1000));
+    }
+}
+
+static void wifi_ap_restore_wifi_ps(void)
+{
+    if (s_wifi_boosted) {
+        s_wifi_boosted = false;
+        esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+
+        /* Restore BT QoS poll interval to normal (0x80 = 80ms) */
+        const tinypan_config_t *cfg = tinypan_internal_get_config();
+        if (cfg && (cfg->remote_addr[0] || cfg->remote_addr[5])) {
+            esp_bt_gap_set_qos(cfg->remote_addr, 0x80);
+        }
+
+        ESP_LOGI(TAG, "WiFi PS -> MIN_MODEM + BT QoS 0x80 (handshake done)");
+    }
+}
+
+void wifi_ap_poll_handshake_timeout(void)
+{
+    if (s_wifi_boosted) {
+        int64_t now = esp_timer_get_time() / 1000;
+        if (now >= s_wifi_boost_until_ms) {
+            wifi_ap_restore_wifi_ps();
+        }
+    }
+}
+
+bool wifi_ap_check_handshake_completed(void)
+{
+    if (s_handshake_completed) {
+        s_handshake_completed = false;
+        return true;
+    }
+    return false;
 }
 
 /* ── Helpers ───────────────────────────────────────────────────── */
@@ -201,11 +283,22 @@ esp_err_t wifi_ap_start(void)
         return ret;
     }
 
-    /* Set WiFi to minimum power save (required when BT is active).
-     * WIFI_PS_NONE is not allowed with BT enabled, but MIN_MODEM gives
-     * WiFi the most airtime while satisfying coexistence requirements. */
+    /* Set WiFi to minimum power save for BT coexistence.
+     * WIFI_PS_NONE is used temporarily during station handshakes
+     * (see wifi_ap_boost_wifi_for_handshake) to give WiFi maximum
+     * airtime for EAPOL. MIN_MODEM is the normal operating mode. */
     esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
-    ESP_LOGI(TAG, "WiFi PS set to MIN_MODEM for BT coexistence");
+
+    /* Set coexistence preference to WiFi permanently.
+     * The BT PAN link is not latency-sensitive (BNEP keepalives every 2s,
+     * bulk data transfer), so giving WiFi priority has minimal impact on BT
+     * throughput but dramatically improves WiFi reliability — especially
+     * the EAPOL 4-way handshake which is sensitive to RF gaps.
+     *
+     * With BALANCE mode, some client devices (notably Chromebooks with
+     * strict 4-second EAPOL timeouts) fail to complete the handshake. */
+    esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
+    ESP_LOGI(TAG, "WiFi PS set to MIN_MODEM, coex PREFER_WIFI (permanent)");
 
     /* Force HT20 bandwidth — avoids HT40→HT20 channel switch disruption
      * when a station associates, which can cause EAPOL frame loss. */

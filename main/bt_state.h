@@ -154,6 +154,16 @@ void bt_state_process(void);
  */
 bool bt_state_backoff_pending(void);
 
+/**
+ * @brief  Suppress (or re-enable) automatic reconnection on ACL loss.
+ *
+ * Used when the application intentionally disconnects BT (e.g. BT
+ * on-demand mode frees the antenna for WiFi). While suppressed, an
+ * ACL_DISCONNECTED event does NOT schedule a backoff reconnect.
+ * Enabling suppression also cancels any pending backoff/reconnect.
+ */
+void bt_state_set_reconnect_suppressed(bool suppressed);
+
 #ifdef __cplusplus
 }
 #endif

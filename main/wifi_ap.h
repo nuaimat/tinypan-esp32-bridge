@@ -129,6 +129,36 @@ bool wifi_ap_bt_pause_active(void);
  */
 void wifi_ap_bt_pause(uint32_t duration_ms);
 
+/**
+ * @brief Temporarily boost WiFi airtime for station handshake.
+ *
+ * Switches WiFi to WIFI_PS_NONE (maximum airtime) so the EAPOL 4-way
+ * handshake can complete despite BT active-mode competition. Restored
+ * to WIFI_PS_MIN_MODEM automatically after the timeout or when the
+ * station connects (STACONNECTED event).
+ *
+ * @param duration_ms  Boost window in milliseconds.
+ */
+void wifi_ap_boost_wifi_for_handshake(uint32_t duration_ms);
+
+/**
+ * @brief Poll for handshake timeout — call from main loop.
+ *
+ * Restores WIFI_PS_MIN_MODEM if the boost window has expired.
+ */
+void wifi_ap_poll_handshake_timeout(void);
+
+/**
+ * @brief Check if a station completed the EAPOL handshake since last call.
+ *
+ * Returns true if WIFI_EVENT_AP_STACONNECTED fired since the last call.
+ * Used by the BT-pause logic to know when to reconnect BT after
+ * disconnecting it for a WiFi handshake.
+ *
+ * @return true if a station completed the handshake, false otherwise.
+ */
+bool wifi_ap_check_handshake_completed(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -456,11 +456,13 @@ void hal_bt_poll(void) {
     }
 
     /* Fire deferred completion events (Breaks recursion loop from app task) */
-    if (s_tx_complete_pending) {
-        s_tx_complete_pending = false;
-        if (s_event_cb) {
-            s_event_cb(HAL_L2CAP_EVENT_TX_COMPLETE, 0, s_event_cb_data);
-        }
+    bool tx_complete = false;
+    portENTER_CRITICAL_SAFE(&s_state_spinlock);
+    tx_complete = s_tx_complete_pending;
+    s_tx_complete_pending = false;
+    portEXIT_CRITICAL_SAFE(&s_state_spinlock);
+    if (tx_complete && s_event_cb) {
+        s_event_cb(HAL_L2CAP_EVENT_TX_COMPLETE, 0, s_event_cb_data);
     }
 
     /* Drain L2CAP data from MessageBuffer */
@@ -489,7 +491,9 @@ void hal_bt_drain_events(void) {
     }
 
     /* Also clear the deferred TX complete flag */
+    portENTER_CRITICAL_SAFE(&s_state_spinlock);
     s_tx_complete_pending = false;
+    portEXIT_CRITICAL_SAFE(&s_state_spinlock);
 }
 
 /* ============================================================================
@@ -725,10 +729,9 @@ int hal_bt_l2cap_send_iovec(const tinypan_iovec_t* iov, uint16_t iov_count) {
     portENTER_CRITICAL_SAFE(&s_state_spinlock);
     s_tx_frames++;
     s_tx_bytes += (uint32_t)written;
+    s_tx_complete_pending = true;  /* defer TX_COMPLETE to hal_bt_poll */
     portEXIT_CRITICAL_SAFE(&s_state_spinlock);
 
-    /* Defer TX_COMPLETE to hal_bt_poll */
-    s_tx_complete_pending = true;
     return 0;
 }
 

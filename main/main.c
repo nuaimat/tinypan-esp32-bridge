@@ -35,6 +35,7 @@ static bool     s_bt_paused_for_wifi = false;
 static uint32_t s_bt_pause_start_ms  = 0;
 static esp_bd_addr_t s_paused_bt_bda;  /* saved for reconnect */
 static bool     s_has_paused_bt_bda  = false;
+static uint32_t s_bt_reconnect_start_ms = 0; /* non-blocking reconnect timer */
 
 /* Resilience watchdog: we set this flag when intentionally disconnecting
  * BT for WiFi handshake, so the watchdog doesn't interpret it as a link
@@ -168,19 +169,34 @@ static void reconnect_bt(void)
         bt_state_set_reconnect_suppressed(false);
         return;
     }
-    ESP_LOGI(TAG, "Reconnecting BT to saved BDA");
+    ESP_LOGI(TAG, "Reconnecting BT to saved BDA (delayed)");
     tinypan_set_remote_addr(s_paused_bt_bda);
-    /* Delay to let stale L2CAP disconnect callbacks drain before starting
-     * a new connection. Without this, the supervisor gets a stale disconnect
-     * during CONNECTING and enters a reconnect loop. */
-    vTaskDelay(pdMS_TO_TICKS(BT_RECONNECT_DELAY_MS));
-    tinypan_start();
-    s_bt_paused_for_wifi = false;
-    /* Re-enable bt_state auto-reconnect now that BT is intentionally
-     * back — future ACL drops are genuine link failures again. */
-    bt_state_set_reconnect_suppressed(false);
-    /* resilience_set_reconnect_in_progress(false) will be called
-     * by resilience_notify_online() when PAN comes back up. */
+    /* Non-blocking delay: schedule the actual start() after BT_RECONNECT_DELAY_MS.
+     * We do NOT call vTaskDelay here — that would block the entire main task
+     * for 3 seconds, stalling LED updates, DNS passthrough toggling,
+     * pan_manager_process(), and bt_state_process(). */
+    s_bt_reconnect_start_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+}
+
+/**
+ * Poll non-blocking reconnect timer.
+ * Called every iteration from poll_station_changes().
+ */
+static void poll_bt_reconnect_timer(void)
+{
+    if (s_bt_reconnect_start_ms == 0) {
+        return; /* No pending reconnect */
+    }
+    uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    if ((int32_t)(now - s_bt_reconnect_start_ms) >= BT_RECONNECT_DELAY_MS) {
+        ESP_LOGI(TAG, "BT reconnect timer expired — starting connection");
+        tinypan_start();
+        s_bt_paused_for_wifi = false;
+        bt_state_set_reconnect_suppressed(false);
+        /* resilience_set_reconnect_in_progress(false) will be called
+         * by resilience_notify_online() when PAN comes back up. */
+        s_bt_reconnect_start_ms = 0; /* Reset timer */
+    }
 }
 
 static void poll_station_changes(void)
@@ -189,6 +205,9 @@ static void poll_station_changes(void)
     static int      s_last_count = 0;
     static uint32_t s_no_stations_since_ms = 0;  /* 0 = not tracking */
     static bool     s_ondemand_active = false;   /* set true after boot grace period */
+
+    /* Poll the non-blocking BT reconnect timer first — must run every iteration. */
+    poll_bt_reconnect_timer();
 
     uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
     if (now - s_last_check_ms < 250) {
@@ -242,8 +261,10 @@ static void poll_station_changes(void)
     /* Check if the WiFi boost window has expired */
     wifi_ap_poll_handshake_timeout();
 
-    /* If BT is paused and a station completed the handshake, reconnect BT */
-    if (s_bt_paused_for_wifi && n > 0 && wifi_ap_check_handshake_completed()) {
+    /* If BT is paused and a station completed the handshake, reconnect BT.
+     * Skip if a reconnect is already scheduled (s_bt_reconnect_start_ms != 0). */
+    if (s_bt_paused_for_wifi && n > 0 && s_bt_reconnect_start_ms == 0 &&
+        wifi_ap_check_handshake_completed()) {
         ESP_LOGI(TAG, "WiFi handshake completed — reconnecting BT");
         reconnect_bt();
     }
@@ -266,7 +287,7 @@ static void poll_station_changes(void)
      * ~50-100ms — so `now < s_bt_pause_start_ms` and an unsigned
      * subtraction underflows to ~4.29e9, firing this timeout instantly
      * and causing a BT disconnect/reconnect churn loop every ~13s. */
-    if (s_bt_paused_for_wifi) {
+    if (s_bt_paused_for_wifi && s_bt_reconnect_start_ms == 0) {
         uint32_t now_fresh = xTaskGetTickCount() * portTICK_PERIOD_MS;
         if ((int32_t)(now_fresh - s_bt_pause_start_ms) > (int32_t)BT_ONDEMAND_MAX_PAUSE_MS) {
             ESP_LOGW(TAG, "BT pause timeout (%ds) — reconnecting to keep tethering alive",

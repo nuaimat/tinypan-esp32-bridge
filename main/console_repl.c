@@ -87,6 +87,34 @@ static void send_fmt(const char *fmt, ...)
     send_str(buf);
 }
 
+/* Shared helper: render the connected-client table (MAC/IP/name).
+ * Both `status` and `clients` commands show the same table; a single
+ * implementation keeps the two from drifting apart. */
+static void print_client_table(void)
+{
+    connected_client_t cinfo[AP_MAX_CONNECTIONS];
+    int n = get_connected_clients(cinfo, AP_MAX_CONNECTIONS);
+    if (n == 0) {
+        send_str("  (none)\r\n");
+        return;
+    }
+    send_str("  MAC                  IP              Name\r\n");
+    for (int i = 0; i < n; i++) {
+        const char *name = cinfo[i].name[0] ? cinfo[i].name : "-";
+        if (cinfo[i].has_ip) {
+            ip4_addr_t a; a.addr = cinfo[i].ip;
+            send_fmt("  %02X:%02X:%02X:%02X:%02X:%02X  %-15s %s\r\n",
+                cinfo[i].mac[0], cinfo[i].mac[1], cinfo[i].mac[2],
+                cinfo[i].mac[3], cinfo[i].mac[4], cinfo[i].mac[5],
+                ip4addr_ntoa(&a), name);
+        } else {
+            send_fmt("  %02X:%02X:%02X:%02X:%02X:%02X  (no IP)         %s\r\n",
+                cinfo[i].mac[0], cinfo[i].mac[1], cinfo[i].mac[2],
+                cinfo[i].mac[3], cinfo[i].mac[4], cinfo[i].mac[5], name);
+        }
+    }
+}
+
 /* ── Command Handlers ────────────────────────────────────────── */
 
 static void cmd_help(void)
@@ -126,25 +154,7 @@ static void cmd_status(void)
     send_fmt("WiFi clients: %d\r\n", clients);
 
     /* Per-client detail (DHCP leases + reservations) */
-    connected_client_t cinfo[AP_MAX_CONNECTIONS];
-    int n = get_connected_clients(cinfo, AP_MAX_CONNECTIONS);
-    if (n > 0) {
-        send_str("  MAC                  IP              Name\r\n");
-        for (int i = 0; i < n; i++) {
-            const char *name = cinfo[i].name[0] ? cinfo[i].name : "-";
-            if (cinfo[i].has_ip) {
-                ip4_addr_t a; a.addr = cinfo[i].ip;
-                send_fmt("  %02X:%02X:%02X:%02X:%02X:%02X  %-15s %s\r\n",
-                    cinfo[i].mac[0], cinfo[i].mac[1], cinfo[i].mac[2],
-                    cinfo[i].mac[3], cinfo[i].mac[4], cinfo[i].mac[5],
-                    ip4addr_ntoa(&a), name);
-            } else {
-                send_fmt("  %02X:%02X:%02X:%02X:%02X:%02X  (no IP)         %s\r\n",
-                    cinfo[i].mac[0], cinfo[i].mac[1], cinfo[i].mac[2],
-                    cinfo[i].mac[3], cinfo[i].mac[4], cinfo[i].mac[5], name);
-            }
-        }
-    }
+    print_client_table();
 
     /* WAN byte counters (PAN upstream) */
     send_fmt("WAN bytes: sent=%llu recv=%llu\r\n",
@@ -328,27 +338,7 @@ static void cmd_wifi(void)
 static void cmd_clients(void)
 {
     send_str("\r\nConnected clients:\r\n");
-    connected_client_t cinfo[AP_MAX_CONNECTIONS];
-    int n = get_connected_clients(cinfo, AP_MAX_CONNECTIONS);
-    if (n == 0) {
-        send_str("  (none)\r\n");
-    } else {
-        send_str("  MAC                  IP              Name\r\n");
-        for (int i = 0; i < n; i++) {
-            const char *name = cinfo[i].name[0] ? cinfo[i].name : "-";
-            if (cinfo[i].has_ip) {
-                ip4_addr_t a; a.addr = cinfo[i].ip;
-                send_fmt("  %02X:%02X:%02X:%02X:%02X:%02X  %-15s %s\r\n",
-                    cinfo[i].mac[0], cinfo[i].mac[1], cinfo[i].mac[2],
-                    cinfo[i].mac[3], cinfo[i].mac[4], cinfo[i].mac[5],
-                    ip4addr_ntoa(&a), name);
-            } else {
-                send_fmt("  %02X:%02X:%02X:%02X:%02X:%02X  (no IP)         %s\r\n",
-                    cinfo[i].mac[0], cinfo[i].mac[1], cinfo[i].mac[2],
-                    cinfo[i].mac[3], cinfo[i].mac[4], cinfo[i].mac[5], name);
-            }
-        }
-    }
+    print_client_table();
     send_str("\r\n");
 }
 

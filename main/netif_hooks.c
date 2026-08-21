@@ -12,10 +12,7 @@
 
 #include <inttypes.h>
 #include <string.h>
-#include <time.h>
 #include "esp_log.h"
-#include "esp_timer.h"
-#include "esp_wifi.h"
 #include "esp_netif.h"
 #include "lwip/netif.h"
 #include "lwip/ip_addr.h"
@@ -23,10 +20,15 @@
 #include "lwip/prot/ip4.h"
 #include "lwip/inet_chksum.h"
 #include "router_config.h"
-#include "wifi_config.h"
 #include "pan_manager.h"
 
 static const char *TAG = "netif_hooks";
+
+/* ── Byte counters (PAN upstream WAN side) ──────────────────────
+ * Only accessed within this file (incremented by the hooks, read by the
+ * accessor functions below) to avoid exposing raw mutable globals. */
+static uint64_t sta_bytes_sent     = 0;
+static uint64_t sta_bytes_received = 0;
 
 /* ── Original netif function pointers ────────────────────────── */
 static netif_input_fn      original_netif_input      = NULL;
@@ -77,6 +79,14 @@ static err_t pan_linkoutput_hook(struct netif *netif, struct pbuf *p)
 static void clamp_tcp_mss(struct pbuf *p, uint16_t max_mss)
 {
     if (max_mss == 0 || p == NULL) return;
+
+    /* Never modify a shared pbuf in place. The payload may be referenced by
+     * another lwIP path (e.g., ARP/ICMP echo replies, queued TX) and writing
+     * into it would corrupt that consumer. SYN segments are freshly
+     * allocated by the sender, so this only skips clamping in the rare
+     * shared-pbuf case rather than risking memory corruption. */
+    if (p->ref > 1) return;
+
     if (p->len < 14 + 20 + 20) return;
 
     uint8_t *payload = (uint8_t *)p->payload;
@@ -140,57 +150,35 @@ void init_byte_counter(void)
     }
 }
 
-uint64_t get_sta_bytes_sent(void)    { return sta_bytes_sent; }
-uint64_t get_sta_bytes_received(void) { return sta_bytes_received; }
+/* ── Atomic-safe 64-bit reads for the byte counters ─────────────── */
 
-void reset_sta_byte_counts(void)
+static uint64_t read_64bit_counter(volatile uint64_t *counter)
 {
-    sta_bytes_sent     = 0;
-    sta_bytes_received = 0;
+    /* Seqlock-style read for a 64-bit counter that is incremented by a single
+     * writer (the tcpip thread) possibly running on the other core. Reading
+     * the two 32-bit halves explicitly and retrying on a high-word change
+     * yields a consistent (hi, lo) pair for a monotonic counter. ESP32 is
+     * little-endian: words[0] = low, words[1] = high. */
+    const volatile uint32_t *words = (const volatile uint32_t *)counter;
+    uint32_t hi1, lo, hi2;
+    do {
+        hi1 = words[1];
+        lo  = words[0];
+        hi2 = words[1];
+    } while (hi1 != hi2); /* Retry if high word changed mid-read */
+    return ((uint64_t)hi1 << 32) | lo;
 }
 
-void resync_connect_count(void)
+uint64_t get_sta_bytes_sent(void)
 {
-    wifi_sta_list_t sta_list;
-    if (esp_wifi_ap_get_sta_list(&sta_list) == ESP_OK) {
-        connect_count = sta_list.num;
-    }
+    /* Lock-free seqlock-style read. The counters are incremented by a single
+     * writer (the tcpip thread) which may run on the other core, so a plain
+     * read or portENTER_CRITICAL (current core only) would still risk a torn
+     * 64-bit value. The retry loop detects a high-word change mid-read. */
+    return read_64bit_counter(&sta_bytes_sent);
 }
 
-/* ── Uptime ──────────────────────────────────────────────────── */
-
-uint32_t get_uptime_seconds(void)
+uint64_t get_sta_bytes_received(void)
 {
-    return (uint32_t)(esp_timer_get_time() / 1000000ULL);
-}
-
-void format_uptime(uint32_t seconds, char *buf, size_t buf_len)
-{
-    uint32_t days  = seconds / 86400;
-    uint32_t hours = (seconds % 86400) / 3600;
-    uint32_t mins  = (seconds % 3600) / 60;
-    uint32_t secs  = seconds % 60;
-    if (days > 0)
-        snprintf(buf, buf_len, "%lud %02lu:%02lu:%02lu",
-                 (unsigned long)days, (unsigned long)hours,
-                 (unsigned long)mins, (unsigned long)secs);
-    else
-        snprintf(buf, buf_len, "%02lu:%02lu:%02lu",
-                 (unsigned long)hours, (unsigned long)mins, (unsigned long)secs);
-}
-
-void format_boot_time(char *buf, size_t buf_len)
-{
-    time_t now;
-    time(&now);
-    if (now < 100000) {
-        snprintf(buf, buf_len, "unknown");
-        return;
-    }
-    time_t boot_time = now - (time_t)get_uptime_seconds();
-    struct tm timeinfo;
-    localtime_r(&boot_time, &timeinfo);
-    snprintf(buf, buf_len, "%04d-%02d-%02d %02d:%02d:%02d",
-             timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
-             timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    return read_64bit_counter(&sta_bytes_received);
 }

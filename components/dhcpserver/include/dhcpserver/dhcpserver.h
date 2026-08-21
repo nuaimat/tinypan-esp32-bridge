@@ -36,9 +36,9 @@ typedef struct dhcps_msg {
 
 /*   Defined in esp_misc.h */
 typedef struct {
-	bool enable;
-	ip4_addr_t start_ip;
-	ip4_addr_t end_ip;
+    bool enable;
+    ip4_addr_t start_ip;
+    ip4_addr_t end_ip;
 } dhcps_lease_t;
 
 enum dhcps_offer_option{

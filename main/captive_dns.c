@@ -86,6 +86,29 @@ static QueueHandle_t s_fwd_queue = NULL;
 
 /* ── Forward task (separate FreeRTOS task) ──────────────────── */
 
+/* ── DNS forward diagnostics ─────────────────────────────────────
+ * fwd_ok/fwd_timeout: replies relayed vs. recvfrom timeouts (each timeout
+ * blocks the serialized fwd_task for the full SO_RCVTIMEO, starving the
+ * queue). rtt_max_ms: worst reply round-trip. Logged every ~10 s. */
+static struct {
+    uint32_t fwd_ok, fwd_timeout, sendto_err, queue_full;
+    uint32_t rtt_max_ms;
+    uint32_t last_log_ms;
+} s_dnsstat;
+
+static void dns_stat_maybe_log(void)
+{
+    uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    if (now - s_dnsstat.last_log_ms >= 10000) {
+        s_dnsstat.last_log_ms = now;
+        ESP_LOGI(TAG, "dnsstat: ok=%u timeout=%u senderr=%u qfull=%u rtt_max=%ums",
+                 (unsigned)s_dnsstat.fwd_ok, (unsigned)s_dnsstat.fwd_timeout,
+                 (unsigned)s_dnsstat.sendto_err, (unsigned)s_dnsstat.queue_full,
+                 (unsigned)s_dnsstat.rtt_max_ms);
+        s_dnsstat.rtt_max_ms = 0;
+    }
+}
+
 static void fwd_task(void *arg)
 {
     (void)arg;
@@ -99,6 +122,7 @@ static void fwd_task(void *arg)
         if (s_fwd_sock < 0) {
             continue;
         }
+        uint32_t q_start_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
         /* Forward query to phone's DNS server */
         struct sockaddr_in dst;
@@ -110,7 +134,9 @@ static void fwd_task(void *arg)
         int sent = sendto(s_fwd_sock, msg.data, msg.len, 0,
                           (struct sockaddr *)&dst, sizeof(dst));
         if (sent <= 0) {
+            s_dnsstat.sendto_err++;
             ESP_LOGW(TAG, "DNS forward sendto failed: errno=%d", errno);
+            dns_stat_maybe_log();
             continue;
         }
         ESP_LOGD(TAG, "DNS query forwarded (%d bytes)", sent);
@@ -126,6 +152,10 @@ static void fwd_task(void *arg)
             int n = recvfrom(s_fwd_sock, reply_buf, sizeof(reply_buf), 0,
                              (struct sockaddr *)&from, &from_len);
             if (n <= 0) {
+                s_dnsstat.fwd_timeout++;
+                ESP_LOGW(TAG, "DNS fwd reply timeout after %lums (errno=%d)",
+                         (unsigned long)(xTaskGetTickCount() * portTICK_PERIOD_MS - q_start_ms),
+                         errno);
                 /* Forward failed — send SERVFAIL to client so it retries */
                 if (s_dns_pcb) {
                     /* Walk past the question name in the original query */
@@ -168,6 +198,12 @@ static void fwd_task(void *arg)
                              reply_txid, query_txid);
                     continue;
                 }
+            }
+            {
+                uint32_t rtt = xTaskGetTickCount() * portTICK_PERIOD_MS - q_start_ms;
+                if (rtt > s_dnsstat.rtt_max_ms) s_dnsstat.rtt_max_ms = rtt;
+                s_dnsstat.fwd_ok++;
+                dns_stat_maybe_log();
             }
             if (s_dns_pcb && s_passthrough) {
                 /* Relay the DNS reply back to the original client via raw UDP.
@@ -222,6 +258,7 @@ static void dns_recv_callback(void *arg, struct udp_pcb *pcb,
                 pbuf_free(p);
                 return;
             }
+            s_dnsstat.queue_full++;
             ESP_LOGW(TAG, "DNS fwd queue full — serving SERVFAIL response");
         }
         /* Oversized query or queue full: fall through to SERVFAIL response */
@@ -389,7 +426,7 @@ void captive_dns_set_passthrough(bool enabled)
                 /* Start forward task (only once, only with a valid queue) */
                 static bool s_fwd_task_started = false;
                 if (!s_fwd_task_started) {
-                    if (xTaskCreate(fwd_task, "dns_fwd", 3072, NULL, 3, NULL) == pdPASS) {
+                    if (xTaskCreate(fwd_task, "dns_fwd", 6144, NULL, 3, NULL) == pdPASS) {
                         s_fwd_task_started = true;
                     } else {
                         ESP_LOGE(TAG, "Failed to create DNS fwd task");

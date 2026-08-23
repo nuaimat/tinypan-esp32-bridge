@@ -759,6 +759,61 @@ esp_err_t bt_manager_get_peer_bda(esp_bd_addr_t bda)
     return ESP_OK;
 }
 
+/* ── RF suspend/resume for WiFi coexistence ─────────────────────── */
+
+esp_err_t bt_manager_suspend(void)
+{
+    if (!s_initialised) {
+        ESP_LOGW(TAG, "suspend: not initialised — nothing to suspend");
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "Suspending BT stack (Bluedroid + controller) for WiFi RF exclusivity");
+
+    /* Disable Bluedroid first, then the controller (required order). */
+    esp_err_t ret1 = esp_bluedroid_disable();
+    if (ret1 != ESP_OK) {
+        ESP_LOGW(TAG, "Bluedroid disable failed: %s", esp_err_to_name(ret1));
+    }
+
+    esp_err_t ret2 = esp_bt_controller_disable();
+    if (ret2 != ESP_OK) {
+        ESP_LOGW(TAG, "BT controller disable failed: %s", esp_err_to_name(ret2));
+    }
+
+    if (ret1 == ESP_OK && ret2 == ESP_OK) {
+        ESP_LOGI(TAG, "BT stack suspended — WiFi has exclusive RF access (coex=0)");
+    }
+
+    return (ret1 == ESP_OK && ret2 == ESP_OK) ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t bt_manager_resume(void)
+{
+    if (!s_initialised) {
+        ESP_LOGE(TAG, "resume: not initialised");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGI(TAG, "Resuming BT stack (controller + Bluedroid)");
+
+    /* Enable controller first, then Bluedroid (required order). */
+    esp_err_t ret1 = esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT);
+    if (ret1 != ESP_OK) {
+        ESP_LOGE(TAG, "BT controller enable failed: %s", esp_err_to_name(ret1));
+        return ret1;
+    }
+
+    esp_err_t ret2 = esp_bluedroid_enable();
+    if (ret2 != ESP_OK) {
+        ESP_LOGE(TAG, "Bluedroid enable failed: %s", esp_err_to_name(ret2));
+        return ret2;
+    }
+
+    ESP_LOGI(TAG, "BT stack resumed — coex active again");
+    return ESP_OK;
+}
+
 /* ── Pairing / Bonding persistence ─────────────────────────────── */
 
 esp_err_t bt_manager_load_bonded_device(bt_bonded_device_t *device)

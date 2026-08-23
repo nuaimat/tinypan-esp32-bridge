@@ -36,6 +36,25 @@ __attribute__((weak)) bool wifi_ap_bt_pause_active(void) { return false; }
 
 static hal_mutex_t s_bnep_tx_mutex = NULL;
 
+/* ── TX pipeline diagnostics ─────────────────────────────────────
+ * Counters at each stage of the WiFi->BT forwarding path to locate
+ * where packets are dropped or stalled:
+ *   enq_ok       - packets accepted into the TinyPAN TX ring
+ *   enq_full     - packets rejected because the ring was full (lwIP ERR_MEM)
+ *   sent_ok      - successful hal_bt_l2cap_send_iovec() calls
+ *   send_busy    - send returned "congested/busy" (VFS queue full or timeout)
+ *   send_err     - hard send failures (packet dropped)
+ *   tx_complete  - TX_COMPLETE events consumed (ring advanced)
+ *   drain_calls  - times the drain function ran
+ *   drain_inflight - drain aborted early: previous packet still in flight
+ *   write_max_ms - worst-case duration of a single send call (blocking write)
+ */
+static struct {
+    uint32_t enq_ok, enq_full, sent_ok, send_busy, send_err;
+    uint32_t tx_complete, drain_calls, drain_inflight;
+    uint32_t write_max_ms;
+} s_txstat;
+
 static void bnep_transport_frame_cb(const bnep_ethernet_frame_t* frame, void* user_data) {
     (void)user_data;
     TINYPAN_LOG_DEBUG("transport_bnep: Received frame type=0x%04X len=%u",
@@ -131,9 +150,25 @@ static bnep_tx_job_t s_bnep_tx_queue[TINYPAN_TX_QUEUE_LEN];
 static uint8_t s_bnep_tx_head = 0;
 static uint8_t s_bnep_tx_tail = 0;
 
+void bnep_transport_log_stats(void) {
+    unsigned depth = (unsigned)((s_bnep_tx_tail + TINYPAN_TX_QUEUE_LEN - s_bnep_tx_head)
+                                % TINYPAN_TX_QUEUE_LEN);
+    bool head_in_flight = (s_bnep_tx_head != s_bnep_tx_tail) &&
+                          s_bnep_tx_queue[s_bnep_tx_head].in_flight;
+    TINYPAN_LOG_INFO("txstat: enq=%u full=%u sent=%u busy=%u err=%u "
+                     "done=%u drains=%u infl_wait=%u wmax=%ums depth=%u infl=%d",
+                     (unsigned)s_txstat.enq_ok, (unsigned)s_txstat.enq_full,
+                     (unsigned)s_txstat.sent_ok, (unsigned)s_txstat.send_busy,
+                     (unsigned)s_txstat.send_err, (unsigned)s_txstat.tx_complete,
+                     (unsigned)s_txstat.drain_calls, (unsigned)s_txstat.drain_inflight,
+                     (unsigned)s_txstat.write_max_ms, depth, (int)head_in_flight);
+    s_txstat.write_max_ms = 0;
+}
+
 /* Must be exposed to drain the BNEP tx queue */
 void bnep_transport_drain_tx_queue(void) {
     hal_mutex_lock(s_bnep_tx_mutex);
+    s_txstat.drain_calls++;
     
     if (!bnep_drain_control_tx_queue()) {
         hal_mutex_unlock(s_bnep_tx_mutex);
@@ -145,6 +180,9 @@ void bnep_transport_drain_tx_queue(void) {
         return;
     }
     
+#if TINYPAN_HAL_SYNCHRONOUS_TX
+    unsigned batch = 0;
+#endif
     while (s_bnep_tx_head != s_bnep_tx_tail) {
         if (!hal_bt_l2cap_can_send()) {
             hal_bt_l2cap_request_can_send_now();
@@ -170,6 +208,7 @@ void bnep_transport_drain_tx_queue(void) {
                 if (q) pbuf_free(q);
                 return; /* Stop draining until reconnection */
             }
+            s_txstat.drain_inflight++;
             break; /* Packet still legitimately in flight */
         }
         
@@ -226,19 +265,44 @@ void bnep_transport_drain_tx_queue(void) {
             result = -1;
         } else {
             hal_mutex_unlock(s_bnep_tx_mutex);
+            uint32_t t0 = hal_get_tick_ms();
             result = hal_bt_l2cap_send_iovec(job->iov, job->iov_count);
+            uint32_t dt = hal_get_tick_ms() - t0;
+            if (dt > s_txstat.write_max_ms) s_txstat.write_max_ms = dt;
             hal_mutex_lock(s_bnep_tx_mutex);
         }
         
         if (result == 0) {
-            /* Success - HW DMA transfer initiated. Wait for complete event. */
+            /* Success. */
+            s_txstat.sent_ok++;
+#if TINYPAN_HAL_SYNCHRONOUS_TX
+            /* Synchronous HAL: send_iovec() copied the payload into the L2CAP
+             * VFS/ring buffer before returning, so the pbuf is no longer needed.
+             * Free it and advance immediately instead of waiting for the deferred
+             * TX_COMPLETE — this removes the one-packet-per-poll throughput
+             * ceiling. Bound each pass to TINYPAN_TX_DRAIN_BATCH_MAX so a
+             * congested link (where write() blocks on L2CAP backpressure) cannot
+             * stall the application loop for long. */
+            job->p = NULL;
+            s_bnep_tx_head = (s_bnep_tx_head + 1) % TINYPAN_TX_QUEUE_LEN;
+            pbuf_free(q);
+            if (++batch >= TINYPAN_TX_DRAIN_BATCH_MAX) {
+                hal_bt_l2cap_request_can_send_now();
+                break;
+            }
+            continue;
+#else
+            /* Async HAL: hardware DMA holds the pbuf until TX_COMPLETE fires. */
             job->in_flight = true;
             job->sent_at_ms = hal_get_tick_ms();
-            break; /* Standard L2CAP serialization requires one packet at a time */
+            break; /* one packet in flight at a time */
+#endif
         } else if (result > 0) {
+            s_txstat.send_busy++;
             hal_bt_l2cap_request_can_send_now();
             break;
         } else {
+            s_txstat.send_err++;
             /* Drop packet on hard failure */
             TINYPAN_LOG_ERROR("transport_bnep: Queue flush failed: %d", result);
             job->p = NULL;
@@ -325,6 +389,7 @@ void bnep_transport_flush_tx_queue(void) {
 
 static void bnep_transport_on_tx_complete(void) {
     hal_mutex_lock(s_bnep_tx_mutex);
+    s_txstat.tx_complete++;
     if (s_bnep_tx_head != s_bnep_tx_tail) {
         bnep_tx_job_t* job = &s_bnep_tx_queue[s_bnep_tx_head];
         if (job->in_flight) {
@@ -399,9 +464,11 @@ static int bnep_transport_output(struct netif* netif, struct pbuf* p) {
     uint8_t next_tail = (s_bnep_tx_tail + 1) % TINYPAN_TX_QUEUE_LEN;
     if (next_tail == s_bnep_tx_head) {
         /* Queue full, report backpressure */
+        s_txstat.enq_full++;
         hal_mutex_unlock(s_bnep_tx_mutex);
         return ERR_MEM;
     }
+    s_txstat.enq_ok++;
     
     bnep_tx_job_t* job = &s_bnep_tx_queue[s_bnep_tx_tail];
     pbuf_ref(p);

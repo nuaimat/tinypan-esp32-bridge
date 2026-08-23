@@ -57,6 +57,33 @@
 #define TINYPAN_TX_QUEUE_LEN                16
 #endif
 
+/**
+ * HAL TX completion semantics.
+ *
+ * 0 (default): the HAL may perform true asynchronous DMA — the transport must
+ *   keep the pbuf alive and wait for HAL_L2CAP_EVENT_TX_COMPLETE before
+ *   freeing it, one packet in flight at a time.
+ * 1: the HAL's send_iovec() copies the payload synchronously (e.g. into a
+ *   Bluetooth VFS/ring buffer) before returning 0. The transport can free the
+ *   pbuf immediately and drain multiple packets per pass, removing the
+ *   one-packet-per-poll throughput ceiling. Backpressure is then supplied by
+ *   send_iovec() returning 1 (busy).
+ */
+#ifndef TINYPAN_HAL_SYNCHRONOUS_TX
+#define TINYPAN_HAL_SYNCHRONOUS_TX           0
+#endif
+
+/**
+ * Maximum packets drained from the TX queue per drain_tx_queue() pass when
+ * TINYPAN_HAL_SYNCHRONOUS_TX is enabled. Bounds how many synchronous write()
+ * calls (each of which can block on L2CAP congestion) are made in a single
+ * pass, so a congested link cannot stall the application loop for an extended
+ * period. The next batch is scheduled via CAN_SEND_NOW.
+ */
+#ifndef TINYPAN_TX_DRAIN_BATCH_MAX
+#define TINYPAN_TX_DRAIN_BATCH_MAX           4
+#endif
+
 /* ============================================================================
  * Timeout Configuration (in milliseconds)
  * ============================================================================ */

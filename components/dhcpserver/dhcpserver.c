@@ -1261,10 +1261,7 @@ static void handle_dhcp(void *arg,
     struct dhcps_t *dhcps = arg;
     struct dhcps_msg *pmsg_dhcps = NULL;
     s16_t tlen, malloc_len;
-    u16_t i;
-    u16_t dhcps_msg_cnt = 0;
     u8_t *p_dhcps_msg = NULL;
-    u8_t *data;
     s16_t state;
 
     ESP_LOGI(TAG, "handle_dhcp: received packet, len=%d", p ? p->tot_len : 0);
@@ -1293,37 +1290,18 @@ static void handle_dhcp(void *arg,
 
     p_dhcps_msg = (u8_t *)pmsg_dhcps;
     tlen = p->tot_len;
-    data = p->payload;
 
 #if DHCPS_DEBUG
     DHCPS_LOG("dhcps: handle_dhcp-> p->tot_len = %d\n", tlen);
     DHCPS_LOG("dhcps: handle_dhcp-> p->len = %d\n", p->len);
 #endif
 
-    for (i = 0; i < p->len; i++) {
-        p_dhcps_msg[dhcps_msg_cnt++] = data[i];
-#if DHCPS_DEBUG
-        DHCPS_LOG("%02x ", data[i]);
-
-        if ((i + 1) % 16 == 0) {
-            DHCPS_LOG("\n");
-        }
-
-#endif
-    }
-
-    /* Copy all segments safely — handles any number of pbufs */
-    u16_t bytes_copied = 0;
-    struct pbuf *q = p;
-    while (q != NULL && bytes_copied < tlen) {
-        u16_t seg_len = q->len;
-        if (seg_len > 0) {
-            memcpy(p_dhcps_msg + dhcps_msg_cnt, q->payload, seg_len);
-            dhcps_msg_cnt += seg_len;
-            bytes_copied += seg_len;
-        }
-        q = q->next;
-    }
+    /* Copy all pbuf segments into a contiguous buffer.
+     * Handles any number of pbufs (the original code only copied the
+     * first two segments). Uses pbuf_copy_partial for a bounds-safe copy
+     * that reads exactly tlen bytes regardless of pbuf segmentation. */
+    u16_t bytes_copied = pbuf_copy_partial(p, p_dhcps_msg, tlen, 0);
+    (void)bytes_copied;
 
 #if DHCPS_DEBUG
     DHCPS_LOG("dhcps: handle_dhcp-> parse_msg(p)\n");

@@ -22,6 +22,21 @@ target_compile_definitions(__idf_bt PRIVATE
     BTA_DM_LINK_POLICY_SETTINGS=0x0003
     BTA_FTS_OPS_IDLE_TO_SNIFF_DELAY_MS=0xFF00
     BTA_FTC_OPS_IDLE_TO_SNIFF_DELAY_MS=0xFF00
+    # L2CAP TX congestion quota. Each queued GAP TX buffer costs 4112 bytes
+    # (GAP_DATA_BUF_SIZE) regardless of packet size. Default quota is
+    # 10 * (tx_rate + rx_rate) = 40 buffers = ~164 KB — far more than free
+    # heap, so under WiFi->BT forwarding load the heap is exhausted
+    # (BT_OSI malloc failed, size=4112) before L2CAP congestion ever trips.
+    # Quota 1 -> 4 buffers (~16 KB) in flight; congestion then propagates
+    # backpressure to the VFS write path and TinyPAN's bounded TX queue,
+    # so excess packets are dropped at the router queue instead of
+    # crashing the heap.
+    L2CAP_CBB_DEFAULT_DATA_RATE_BUFF_QUOTA=1
+    # Each GAP TX chunk buffer is GAP_DATA_BUF_SIZE bytes regardless of
+    # payload (default 4112). BNEP L2CAP MTU is fixed at 1691, so the
+    # worst case need is BT_HDR(8) + L2CAP_MIN_OFFSET(13) + 1691 = 1712.
+    # 2048 halves the per-buffer heap cost with a safe margin.
+    GAP_DATA_BUF_SIZE=2048
 )
 
 # ── SPIFFS partition image from main/www/ directory ──────────────

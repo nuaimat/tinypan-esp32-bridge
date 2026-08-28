@@ -371,13 +371,16 @@ esp_err_t wifi_ap_start(void)
      * airtime for EAPOL. MIN_MODEM is the normal operating mode. */
     esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
 
-    /* Do NOT call esp_coex_preference_set() on a SoftAP. The default
-     * PREFER_BT keeps SoftAP beacons alive AND gives BT the RF priority it
-     * needs to drain the PAN TX queue. PREFER_WIFI here was starving BT TX
-     * under WiFi load — the "TX wedges while RX keepalives trickle through"
-     * signature — while the real Chromebook EAPOL fix is HT20 below, not
-     * coex preference. */
-    ESP_LOGI(TAG, "WiFi PS set to MIN_MODEM, coex preference left at default (PREFER_BT)");
+    /* Coexistence preference: WiFi. The ADR experiment (PREFER_WIFI vs
+     * PREFER_BT) showed no difference in BT PAN throughput — the wedge was
+     * phone-side either way — while removing PREFER_WIFI regressed iPhone
+     * association: with BT active (coex on), EAPOL/auth frames get starved
+     * and the AP deauthenticates the station with reason=2 in bursts
+     * ("unable to join network"). First joins only succeeded while BT was
+     * suspended (on-demand mode). PREFER_WIFI is therefore strictly the
+     * better setting for this bridge. */
+    esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
+    ESP_LOGI(TAG, "WiFi PS set to MIN_MODEM, coex PREFER_WIFI");
 
     /* Force HT20 bandwidth — avoids HT40→HT20 channel switch disruption
      * when a station associates, which can cause EAPOL frame loss. */

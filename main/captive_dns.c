@@ -54,7 +54,7 @@ static int s_fwd_sock = -1;                      /* UDP socket for forwarding + 
 /* Queue to pass DNS queries from lwIP callback to forward task.
  * sendto() cannot be called from the tcpip_thread (it posts back to
  * the same thread), so we defer to a separate task. */
-#define DNS_FWD_QUEUE_LEN 16
+#define DNS_FWD_QUEUE_LEN 8
 typedef struct {
     uint8_t data[512];
     uint16_t len;

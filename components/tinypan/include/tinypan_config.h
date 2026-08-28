@@ -233,7 +233,8 @@
 /**
  * Stack size (bytes) for the BNEP TX drain task. This task owns
  * bnep_transport_drain_tx_queue() so that a blocking L2CAP VFS write() (up to
- * 40 s under WiFi+BT coexistence congestion) cannot stall the application main
+ * VFS_WRITE_TIMEOUT=500 ms under WiFi+BT coexistence congestion) cannot stall
+ * the application main
  * loop, which also runs hal_bt_poll (RX drain + TX_COMPLETE) and the watchdog.
  */
 #ifndef TINYPAN_BNEP_TX_TASK_STACK

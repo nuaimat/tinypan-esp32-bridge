@@ -147,7 +147,8 @@ static void bnep_transport_on_can_send_now(void) {
     }
 #if TINYPAN_ENABLE_LWIP
     /* Wake the dedicated TX task instead of draining inline. The drain (which
-     * can block in write() for up to 40 s under congestion) runs in tp_tx_task,
+     * can block in write() for up to VFS_WRITE_TIMEOUT=500 ms under
+     * congestion) runs in tp_tx_task,
      * so this handler — called from hal_bt_poll() in the app main loop — stays
      * non-blocking. */
     hal_semaphore_give(s_bnep_tx_semaphore);
@@ -517,7 +518,8 @@ static int bnep_transport_output(struct netif* netif, struct pbuf* p) {
 
     /* Wake the dedicated TX task. It drains the queue via
      * bnep_transport_drain_tx_queue(); the drain (which can block in write()
-     * for up to 40 s under congestion) runs in tp_tx_task, not here. */
+     * for up to VFS_WRITE_TIMEOUT=500 ms under congestion) runs in tp_tx_task,
+     * not here. */
     hal_semaphore_give(s_bnep_tx_semaphore);
     
     return ERR_OK;

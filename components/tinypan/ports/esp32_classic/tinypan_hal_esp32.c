@@ -222,13 +222,15 @@ static void esp_l2cap_cb(esp_bt_l2cap_cb_event_t event,
 
             /* Set QoS poll interval to balance BT responsiveness with WiFi
              * airtime. Sniff mode is disabled via link policy, so this just
-             * controls how often the master polls us. 0x40 = 64 * 0.625ms
-             * = 40ms — more frequent polling gives the slave (us) more TX
-             * slots, addressing the TX-drain stall under WiFi+BT coex load
-             * (the master otherwise polls too rarely and our L2CAP TX queue
-             * wedges). Trade-off: slightly less RF time for WiFi. */
+             * controls how often the master polls us. 0x80 = 128 * 0.625ms
+             * = 80ms. 0x40 (40ms) was tried to give the slave more TX slots,
+             * but it starved the WiFi side — iPhone deauthed in bursts
+             * (reason=2 AUTH_EXPIRE, 209 SA_QUERY_TIMEOUT) after ~2.5 min of
+             * sustained BT traffic. With the dedicated TX task +
+             * VFS_WRITE_TIMEOUT=500ms + quota=2, BT TX no longer needs the
+             * aggressive poll (busy=0, wmax<=5ms with 0x40). */
 #ifndef TINYPAN_BT_QOS_POLL
-#define TINYPAN_BT_QOS_POLL 0x40
+#define TINYPAN_BT_QOS_POLL 0x80
 #endif
             esp_err_t qos_ret = esp_bt_gap_set_qos(param->open.rem_bda, TINYPAN_BT_QOS_POLL);
             if (qos_ret != ESP_OK) {

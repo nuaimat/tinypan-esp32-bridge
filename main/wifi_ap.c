@@ -179,14 +179,14 @@ static void wifi_ap_apply_ps_restore(void)
     esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
 
     /* Restore BT QoS poll interval to normal. Must match the connect-time
-     * TINYPAN_BT_QOS_POLL (0x40) in tinypan_hal_esp32.c — a hardcoded 0x80
+     * TINYPAN_BT_QOS_POLL (0x80) in tinypan_hal_esp32.c — a hardcoded value
      * here clobbers the tuned value on every handshake restore. */
     const tinypan_config_t *cfg = tinypan_internal_get_config();
     if (cfg && (cfg->remote_addr[0] || cfg->remote_addr[5])) {
-        esp_bt_gap_set_qos(cfg->remote_addr, 0x40);
+        esp_bt_gap_set_qos(cfg->remote_addr, 0x80);
     }
 
-    ESP_LOGI(TAG, "WiFi PS -> MIN_MODEM + BT QoS 0x40 (handshake done)");
+    ESP_LOGI(TAG, "WiFi PS -> MIN_MODEM + BT QoS 0x80 (handshake done)");
 }
 
 static void wifi_ap_restore_wifi_ps(void)

@@ -91,6 +91,7 @@ static uint32_t s_pan_reconnect_stop_ms = 0; /* when tinypan_stop() was called *
 static uint32_t s_tx_last_sent      = 0;
 static uint32_t s_tx_stall_since_ms = 0;
 static uint32_t s_last_tx_wedge_ms  = 0;
+static uint32_t s_traffic_adv_ms    = 0;  /* last time TX sent counter advanced */
 
 /* From tinypan_bnep_transport.c (same extern pattern as main.c) */
 extern void bnep_transport_get_tx_stats(uint32_t* sent_ok, uint32_t* depth);
@@ -599,6 +600,9 @@ void resilience_process(void)
     {
         uint32_t sent = 0, depth = 0;
         bnep_transport_get_tx_stats(&sent, &depth);
+        if (sent != s_tx_last_sent) {
+            s_traffic_adv_ms = now;  /* TX active — used by the STALLED threshold */
+        }
         if (depth == 0 || s_reconnect_in_progress || s_pan_reconnect_pending) {
             s_tx_last_sent = sent;
             s_tx_stall_since_ms = 0;
@@ -691,6 +695,13 @@ void resilience_process(void)
             bool link_alive = bt_link_is_alive();
             int threshold = link_alive ? RESILIENCE_PROBE_FAIL_THRESHOLD_ALIVE
                                        : RESILIENCE_PROBE_FAIL_THRESHOLD_DEAD;
+            if (link_alive &&
+                (now - s_traffic_adv_ms) <= RESILIENCE_TRAFFIC_ACTIVE_MS) {
+                /* Client actively pushing traffic but upstream is dead —
+                 * likely the Android BT-PAN "TX flows, RX dead" stall.
+                 * Don't wait 5 min; bounce the PAN link sooner. */
+                threshold = RESILIENCE_PROBE_FAIL_THRESHOLD_STALLED;
+            }
 
             ESP_LOGW(TAG, "Upstream probe FAILED (%d/%d) — BT link %s",
                      s_probe_failures, threshold,

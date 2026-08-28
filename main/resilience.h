@@ -45,6 +45,22 @@ extern "C"
 #define RESILIENCE_PROBE_FAIL_THRESHOLD_ALIVE 15
 #endif
 
+/** Lower ALIVE threshold used while a WiFi client is actively pushing TX
+ *  traffic. Covers the "TX flows but nothing comes back" Android BT-PAN
+ *  stall, where sent_ok keeps advancing (so the TX-wedge detector stays
+ *  quiet) yet upstream is dead. The 15-failure grace exists for cellular
+ *  dead spots when nobody is being served; with an active client, 5
+ *  minutes of dead internet is worse than a ~20s PAN bounce. */
+#ifndef RESILIENCE_PROBE_FAIL_THRESHOLD_STALLED
+#define RESILIENCE_PROBE_FAIL_THRESHOLD_STALLED 4
+#endif
+
+/** How recently TX traffic must have advanced for a client to count as
+ *  "active" for the STALLED threshold (ms). */
+#ifndef RESILIENCE_TRAFFIC_ACTIVE_MS
+#define RESILIENCE_TRAFFIC_ACTIVE_MS 60000
+#endif
+
 /** If the system has been continuously offline (no IP / not ONLINE) for
  *  this long, reboot the ESP32 as a last-resort recovery (ms). */
 #ifndef RESILIENCE_OFFLINE_REBOOT_MS

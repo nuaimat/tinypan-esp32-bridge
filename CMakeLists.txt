@@ -27,16 +27,27 @@ target_compile_definitions(__idf_bt PRIVATE
     # 10 * (tx_rate + rx_rate) = 40 buffers = ~164 KB — far more than free
     # heap, so under WiFi->BT forwarding load the heap is exhausted
     # (BT_OSI malloc failed, size=4112) before L2CAP congestion ever trips.
-    # Quota 1 -> 4 buffers (~16 KB) in flight; congestion then propagates
-    # backpressure to the VFS write path and TinyPAN's bounded TX queue,
-    # so excess packets are dropped at the router queue instead of
-    # crashing the heap.
-    L2CAP_CBB_DEFAULT_DATA_RATE_BUFF_QUOTA=1
+    # Quota 1 -> 4 buffers (~8 KB with GAP_DATA_BUF_SIZE=2048) in flight.
+    # Load test showed quota=1 wedges the channel into permanent congestion
+    # under load (sent froze at 57, busy climbed to 273, ~0.4 pkt/s):
+    # bluedroid stops draining the VFS queue once buff_quota is exhausted.
+    # Raising to 2 -> 8 buffers (~16 KB) gives headroom; still far below the
+    # default 40 buffers, so heap stays safe.
+    L2CAP_CBB_DEFAULT_DATA_RATE_BUFF_QUOTA=2
     # Each GAP TX chunk buffer is GAP_DATA_BUF_SIZE bytes regardless of
     # payload (default 4112). BNEP L2CAP MTU is fixed at 1691, so the
     # worst case need is BT_HDR(8) + L2CAP_MIN_OFFSET(13) + 1691 = 1712.
     # 2048 halves the per-buffer heap cost with a safe margin.
     GAP_DATA_BUF_SIZE=2048
+    # Cap the L2CAP VFS write() block at 500ms (default 40s). When
+    # Bluedroid's 10-slot TX fixed-queue is full and the radio drains
+    # slower than the drain pushes, write() would otherwise block the
+    # full 40s — overflowing TinyPAN's bounded TX queue (errno=12 storm)
+    # and starving lwIP. 500ms lets write() return EBUSY so the HAL's
+    # EBUSY/EAGAIN -> request_can_send_now() backoff path engages; the
+    # SLOT_TX_QUEUE_LOW_WM early-wake still unblocks faster when the
+    # radio is draining normally.
+    VFS_WRITE_TIMEOUT=500
 )
 
 # ── SPIFFS partition image from main/www/ directory ──────────────

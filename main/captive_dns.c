@@ -54,7 +54,7 @@ static int s_fwd_sock = -1;                      /* UDP socket for forwarding + 
 /* Queue to pass DNS queries from lwIP callback to forward task.
  * sendto() cannot be called from the tcpip_thread (it posts back to
  * the same thread), so we defer to a separate task. */
-#define DNS_FWD_QUEUE_LEN 8
+#define DNS_FWD_QUEUE_LEN 16
 typedef struct {
     uint8_t data[512];
     uint16_t len;
@@ -418,9 +418,12 @@ void captive_dns_set_passthrough(bool enabled)
                     return;
                 }
                 /* Set receive timeout so recvfrom doesn't block too long.
-                 * 5s allows for BT PAN latency (typically 80-300ms via
-                 * 8.8.8.8, but give margin for cellular RTT). */
-                struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+                 * The fwd_task is fully serialized: a single lost reply
+                 * stalls every queued query for the full SO_RCVTIMEO.
+                 * 1.5s still gives ~5-10x margin over the typical
+                 * 80-300ms BT PAN RTT to 8.8.8.8, but bounds worst-case
+                 * queue stall to 1.5s instead of 5s. */
+                struct timeval tv = { .tv_sec = 1, .tv_usec = 500000 };
                 setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
                 s_fwd_sock = sock;
                 /* Start forward task (only once, only with a valid queue) */

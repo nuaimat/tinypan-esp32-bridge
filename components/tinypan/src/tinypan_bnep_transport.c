@@ -26,6 +26,9 @@
 
 #include <string.h>
 
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+
 /* Forward declare supervisor callbacks we need to emit */
 extern void supervisor_on_bnep_setup_response(uint16_t response_code);
 extern void supervisor_on_bnep_filter_response(uint16_t response_code);
@@ -35,6 +38,10 @@ extern void supervisor_on_bnep_filter_response(uint16_t response_code);
 __attribute__((weak)) bool wifi_ap_bt_pause_active(void) { return false; }
 
 static hal_mutex_t s_bnep_tx_mutex = NULL;
+static hal_semaphore_t s_bnep_tx_semaphore = NULL;  /* wake-up signal for tp_tx task */
+static TaskHandle_t s_tp_tx_task = NULL;            /* dedicated TX drain task */
+
+static void tp_tx_task_fn(void* arg);
 
 /* ── TX pipeline diagnostics ─────────────────────────────────────
  * Counters at each stage of the WiFi->BT forwarding path to locate
@@ -88,6 +95,18 @@ static int bnep_transport_init(void) {
     if (s_bnep_tx_mutex == NULL) {
         s_bnep_tx_mutex = hal_mutex_create();
     }
+    if (s_bnep_tx_semaphore == NULL) {
+        s_bnep_tx_semaphore = hal_semaphore_create();
+    }
+    if (s_tp_tx_task == NULL) {
+        BaseType_t ret = xTaskCreate(tp_tx_task_fn, "tp_tx",
+                                     TINYPAN_BNEP_TX_TASK_STACK, NULL,
+                                     TINYPAN_BNEP_TX_TASK_PRIO, &s_tp_tx_task);
+        if (ret != pdPASS) {
+            TINYPAN_LOG_ERROR("transport_bnep: failed to create tp_tx task");
+            s_tp_tx_task = NULL;
+        }
+    }
 #endif
     
     const tinypan_config_t* config = tinypan_internal_get_config();
@@ -127,8 +146,11 @@ static void bnep_transport_on_can_send_now(void) {
         bnep_send_setup_request();
     }
 #if TINYPAN_ENABLE_LWIP
-    void bnep_transport_drain_tx_queue(void);
-    bnep_transport_drain_tx_queue();
+    /* Wake the dedicated TX task instead of draining inline. The drain (which
+     * can block in write() for up to 40 s under congestion) runs in tp_tx_task,
+     * so this handler — called from hal_bt_poll() in the app main loop — stays
+     * non-blocking. */
+    hal_semaphore_give(s_bnep_tx_semaphore);
 #endif
 }
 
@@ -181,7 +203,9 @@ void bnep_transport_drain_tx_queue(void) {
     }
     
 #if TINYPAN_HAL_SYNCHRONOUS_TX
-    unsigned batch = 0;
+    /* Synchronous HAL: drain the whole queue in one pass. Blocking on write()
+     * is harmless here because this runs in the dedicated tp_tx task, not the
+     * app main loop. */
 #endif
     while (s_bnep_tx_head != s_bnep_tx_tail) {
         if (!hal_bt_l2cap_can_send()) {
@@ -280,16 +304,11 @@ void bnep_transport_drain_tx_queue(void) {
              * VFS/ring buffer before returning, so the pbuf is no longer needed.
              * Free it and advance immediately instead of waiting for the deferred
              * TX_COMPLETE — this removes the one-packet-per-poll throughput
-             * ceiling. Bound each pass to TINYPAN_TX_DRAIN_BATCH_MAX so a
-             * congested link (where write() blocks on L2CAP backpressure) cannot
-             * stall the application loop for long. */
+             * ceiling. This runs in the dedicated tp_tx task, so a congested link
+             * (where write() blocks on L2CAP backpressure) stalls only this task. */
             job->p = NULL;
             s_bnep_tx_head = (s_bnep_tx_head + 1) % TINYPAN_TX_QUEUE_LEN;
             pbuf_free(q);
-            if (++batch >= TINYPAN_TX_DRAIN_BATCH_MAX) {
-                hal_bt_l2cap_request_can_send_now();
-                break;
-            }
             continue;
 #else
             /* Async HAL: hardware DMA holds the pbuf until TX_COMPLETE fires. */
@@ -312,6 +331,21 @@ void bnep_transport_drain_tx_queue(void) {
     }
     
     hal_mutex_unlock(s_bnep_tx_mutex);
+}
+
+/* Dedicated TX drain task.
+ *
+ * Blocks on s_bnep_tx_semaphore until the transport has TX work, then drains
+ * the queue to empty-or-busy. The drain (and its blocking L2CAP VFS write())
+ * runs here, at a priority BELOW the BTU task, so a congested link stalls only
+ * this task — never the app main loop that owns hal_bt_poll / watchdog, and
+ * never the BTU task that unblocks write() by draining the VFS queue. */
+static void tp_tx_task_fn(void* arg) {
+    (void)arg;
+    for (;;) {
+        hal_semaphore_take(s_bnep_tx_semaphore);
+        bnep_transport_drain_tx_queue();
+    }
 }
 
 static void bnep_transport_process(void) {
@@ -399,9 +433,9 @@ static void bnep_transport_on_tx_complete(void) {
             s_bnep_tx_head = (s_bnep_tx_head + 1) % TINYPAN_TX_QUEUE_LEN;
             if (q) pbuf_free(q);
             
-            /* Process next packet */
+            /* Wake the TX task to process the next packet (async HAL path). */
             hal_mutex_unlock(s_bnep_tx_mutex);
-            bnep_transport_drain_tx_queue();
+            hal_semaphore_give(s_bnep_tx_semaphore);
             return;
         }
     }
@@ -481,9 +515,10 @@ static int bnep_transport_output(struct netif* netif, struct pbuf* p) {
     s_bnep_tx_tail = next_tail;
     hal_mutex_unlock(s_bnep_tx_mutex);
 
-    /* Signal the HAL. The application polling thread will drain the queue
-     * via bnep_transport_drain_tx_queue() on the next CAN_SEND_NOW event. */
-    hal_bt_l2cap_request_can_send_now();
+    /* Wake the dedicated TX task. It drains the queue via
+     * bnep_transport_drain_tx_queue(); the drain (which can block in write()
+     * for up to 40 s under congestion) runs in tp_tx_task, not here. */
+    hal_semaphore_give(s_bnep_tx_semaphore);
     
     return ERR_OK;
 }

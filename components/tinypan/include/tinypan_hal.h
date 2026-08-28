@@ -324,6 +324,41 @@ void hal_mutex_unlock(hal_mutex_t mutex);
  */
 void hal_mutex_destroy(hal_mutex_t mutex);
 
+/** Opaque handle for a HAL-provided semaphore */
+typedef void* hal_semaphore_t;
+
+/**
+ * @brief Create a new binary semaphore
+ *
+ * The semaphore starts in the "empty" (0) state. It is used as a task
+ * wake-up signal: `hal_semaphore_take()` blocks while the count is 0, and
+ * `hal_semaphore_give()` raises the count to wake a blocked task. Multiple
+ * gives collapse into a single pending wake-up (binary semantics), which is
+ * safe for the wake-a-drainer pattern where one wake always drains to empty.
+ *
+ * @return Handle to the semaphore, or NULL on failure
+ */
+hal_semaphore_t hal_semaphore_create(void);
+
+/**
+ * @brief Acquire a semaphore (blocking)
+ *
+ * Decrements the semaphore count. Blocks indefinitely while the count is 0.
+ *
+ * @param sem Semaphore handle
+ */
+void hal_semaphore_take(hal_semaphore_t sem);
+
+/**
+ * @brief Release a semaphore
+ *
+ * Increments the semaphore count, waking a task blocked in
+ * `hal_semaphore_take()` if any.
+ *
+ * @param sem Semaphore handle
+ */
+void hal_semaphore_give(hal_semaphore_t sem);
+
 
 #ifdef __cplusplus
 }

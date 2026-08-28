@@ -73,17 +73,6 @@
 #define TINYPAN_HAL_SYNCHRONOUS_TX           0
 #endif
 
-/**
- * Maximum packets drained from the TX queue per drain_tx_queue() pass when
- * TINYPAN_HAL_SYNCHRONOUS_TX is enabled. Bounds how many synchronous write()
- * calls (each of which can block on L2CAP congestion) are made in a single
- * pass, so a congested link cannot stall the application loop for an extended
- * period. The next batch is scheduled via CAN_SEND_NOW.
- */
-#ifndef TINYPAN_TX_DRAIN_BATCH_MAX
-#define TINYPAN_TX_DRAIN_BATCH_MAX           4
-#endif
-
 /* ============================================================================
  * Timeout Configuration (in milliseconds)
  * ============================================================================ */
@@ -239,6 +228,27 @@
  */
 #ifndef TINYPAN_ESP_RX_TASK_PRIO
 #define TINYPAN_ESP_RX_TASK_PRIO            (configMAX_PRIORITIES - 3)
+#endif
+
+/**
+ * Stack size (bytes) for the BNEP TX drain task. This task owns
+ * bnep_transport_drain_tx_queue() so that a blocking L2CAP VFS write() (up to
+ * 40 s under WiFi+BT coexistence congestion) cannot stall the application main
+ * loop, which also runs hal_bt_poll (RX drain + TX_COMPLETE) and the watchdog.
+ */
+#ifndef TINYPAN_BNEP_TX_TASK_STACK
+#define TINYPAN_BNEP_TX_TASK_STACK           4096
+#endif
+
+/**
+ * Priority for the BNEP TX drain task. Must be BELOW the BTU task priority
+ * (BT_TASK_MAX_PRIORITIES - 5, where BT_TASK_MAX_PRIORITIES ==
+ * configMAX_PRIORITIES). The BTU task is what drains the L2CAP VFS TX queue,
+ * so a write() blocked on a full queue can only unblock once the BTU task
+ * runs — the TX task must therefore never be able to preempt it.
+ */
+#ifndef TINYPAN_BNEP_TX_TASK_PRIO
+#define TINYPAN_BNEP_TX_TASK_PRIO            (configMAX_PRIORITIES - 6)
 #endif
 
 /**

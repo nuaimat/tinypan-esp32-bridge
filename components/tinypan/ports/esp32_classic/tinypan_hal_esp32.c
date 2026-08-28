@@ -222,10 +222,13 @@ static void esp_l2cap_cb(esp_bt_l2cap_cb_event_t event,
 
             /* Set QoS poll interval to balance BT responsiveness with WiFi
              * airtime. Sniff mode is disabled via link policy, so this just
-             * controls how often the master polls us. 0x80 = 128 * 0.625ms
-             * = 80ms — less BT polling gives WiFi more RF time. */
+             * controls how often the master polls us. 0x40 = 64 * 0.625ms
+             * = 40ms — more frequent polling gives the slave (us) more TX
+             * slots, addressing the TX-drain stall under WiFi+BT coex load
+             * (the master otherwise polls too rarely and our L2CAP TX queue
+             * wedges). Trade-off: slightly less RF time for WiFi. */
 #ifndef TINYPAN_BT_QOS_POLL
-#define TINYPAN_BT_QOS_POLL 0x80
+#define TINYPAN_BT_QOS_POLL 0x40
 #endif
             esp_err_t qos_ret = esp_bt_gap_set_qos(param->open.rem_bda, TINYPAN_BT_QOS_POLL);
             if (qos_ret != ESP_OK) {
@@ -850,4 +853,20 @@ void hal_mutex_unlock(hal_mutex_t mutex) {
 
 void hal_mutex_destroy(hal_mutex_t mutex) {
     if (mutex) vSemaphoreDelete((SemaphoreHandle_t)mutex);
+}
+
+/* ============================================================================
+ * Semaphore Implementation (FreeRTOS Binary Semaphores)
+ * ============================================================================ */
+
+hal_semaphore_t hal_semaphore_create(void) {
+    return (hal_semaphore_t)xSemaphoreCreateBinary();
+}
+
+void hal_semaphore_take(hal_semaphore_t sem) {
+    if (sem) xSemaphoreTake((SemaphoreHandle_t)sem, portMAX_DELAY);
+}
+
+void hal_semaphore_give(hal_semaphore_t sem) {
+    if (sem) xSemaphoreGive((SemaphoreHandle_t)sem);
 }

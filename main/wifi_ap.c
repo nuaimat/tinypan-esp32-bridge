@@ -178,13 +178,15 @@ static void wifi_ap_apply_ps_restore(void)
 {
     esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
 
-    /* Restore BT QoS poll interval to normal (0x80 = 80ms) */
+    /* Restore BT QoS poll interval to normal. Must match the connect-time
+     * TINYPAN_BT_QOS_POLL (0x40) in tinypan_hal_esp32.c — a hardcoded 0x80
+     * here clobbers the tuned value on every handshake restore. */
     const tinypan_config_t *cfg = tinypan_internal_get_config();
     if (cfg && (cfg->remote_addr[0] || cfg->remote_addr[5])) {
-        esp_bt_gap_set_qos(cfg->remote_addr, 0x80);
+        esp_bt_gap_set_qos(cfg->remote_addr, 0x40);
     }
 
-    ESP_LOGI(TAG, "WiFi PS -> MIN_MODEM + BT QoS 0x80 (handshake done)");
+    ESP_LOGI(TAG, "WiFi PS -> MIN_MODEM + BT QoS 0x40 (handshake done)");
 }
 
 static void wifi_ap_restore_wifi_ps(void)
@@ -369,16 +371,13 @@ esp_err_t wifi_ap_start(void)
      * airtime for EAPOL. MIN_MODEM is the normal operating mode. */
     esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
 
-    /* Set coexistence preference to WiFi permanently.
-     * The BT PAN link is not latency-sensitive (BNEP keepalives every 2s,
-     * bulk data transfer), so giving WiFi priority has minimal impact on BT
-     * throughput but dramatically improves WiFi reliability — especially
-     * the EAPOL 4-way handshake which is sensitive to RF gaps.
-     *
-     * With BALANCE mode, some client devices (notably Chromebooks with
-     * strict 4-second EAPOL timeouts) fail to complete the handshake. */
-    esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
-    ESP_LOGI(TAG, "WiFi PS set to MIN_MODEM, coex PREFER_WIFI (permanent)");
+    /* Do NOT call esp_coex_preference_set() on a SoftAP. The default
+     * PREFER_BT keeps SoftAP beacons alive AND gives BT the RF priority it
+     * needs to drain the PAN TX queue. PREFER_WIFI here was starving BT TX
+     * under WiFi load — the "TX wedges while RX keepalives trickle through"
+     * signature — while the real Chromebook EAPOL fix is HT20 below, not
+     * coex preference. */
+    ESP_LOGI(TAG, "WiFi PS set to MIN_MODEM, coex preference left at default (PREFER_BT)");
 
     /* Force HT20 bandwidth — avoids HT40→HT20 channel switch disruption
      * when a station associates, which can cause EAPOL frame loss. */

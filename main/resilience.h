@@ -77,6 +77,22 @@ extern "C"
 #define RESILIENCE_BT_LINK_ALIVE_MS   15000
 #endif
 
+/** TX wedge self-recovery. The phone can throttle BT-PAN forwarding
+ *  indefinitely while the ACL stays alive (probes keep failing in
+ *  "patient" mode, which by design never reconnects). Signature: TX ring
+ *  holds data (depth>0) but the transport's sent counter stops advancing.
+ *  If the stall lasts this long, force a PAN reconnect — a bounce
+ *  reliably restores flow. */
+#ifndef RESILIENCE_TX_STALL_MS
+#define RESILIENCE_TX_STALL_MS          15000
+#endif
+
+/** Minimum interval between wedge-triggered PAN reconnects, so a phone
+ *  that keeps stalling doesn't cause reconnect thrash. */
+#ifndef RESILIENCE_TX_STALL_COOLDOWN_MS
+#define RESILIENCE_TX_STALL_COOLDOWN_MS 120000
+#endif
+
 /* ── API ───────────────────────────────────────────────────────── */
 
 /**

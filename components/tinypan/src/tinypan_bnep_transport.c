@@ -188,6 +188,18 @@ void bnep_transport_log_stats(void) {
     s_txstat.write_max_ms = 0;
 }
 
+/* Lightweight accessor for the resilience watchdog's TX-wedge detector.
+ * sent_ok advancing = data is flowing; depth>0 with sent frozen = wedge. */
+void bnep_transport_get_tx_stats(uint32_t* sent_ok, uint32_t* depth) {
+    if (sent_ok) {
+        *sent_ok = s_txstat.sent_ok;
+    }
+    if (depth) {
+        *depth = (uint32_t)((s_bnep_tx_tail + TINYPAN_TX_QUEUE_LEN - s_bnep_tx_head)
+                            % TINYPAN_TX_QUEUE_LEN);
+    }
+}
+
 /* Must be exposed to drain the BNEP tx queue */
 void bnep_transport_drain_tx_queue(void) {
     hal_mutex_lock(s_bnep_tx_mutex);

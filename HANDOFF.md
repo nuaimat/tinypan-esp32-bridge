@@ -8,11 +8,41 @@
 **WiFi AP:** SSID `TinyPAN-Bridge`, password `bridge1234`, AP IP `192.168.99.1`
 **BT phone (NAP):** Pixel 7 Pro `d4:3a:2c:99:f8:18`, bonded in NVS (do NOT erase flash/NVS)
 
-## Status: firmware work is at its ceiling — the wedge is PHONE-SIDE
+## Status: wedge confirmed PHONE-SIDE (Android BT-PAN itself) + self-recovery added
 
-The "100% ping loss under load" saga is **closed with a verdict**: the
-throughput wedge is **Android phone-side tethering throttling**, not a
-Bluedroid or firmware bug. Full evidence and rationale:
+**2026-08-27 session — final verdict and new findings:**
+
+- **Wedge is Android's BT-PAN forwarding, full stop.** New evidence on top of
+  the ADR: wedge reproduces with the phone's uplink on **home WiFi** (not
+  cellular — rules out carrier cap / Data Saver), and on the **initial
+  release** `b67f6bd` (bisect test: wedged *faster* than HEAD — no firmware
+  regression; the "worked for 20 minutes" memory predates the phone ever
+  entering its throttled state). The throttle is **sticky**: once triggered it
+  can persist across reconnects for minutes.
+- **Crash-loop fixed (two causes):**
+  1. Bluedroid `packet_fragmenter.c:177 assert(0)` on reassembly OOM under an
+     iPhone's join-traffic burst (heap min hit 576 B). **Patched the shared
+     IDF** (`~/esp/esp-idf/components/bt/host/bluedroid/hci/packet_fragmenter.c`)
+     to drop the packet instead of rebooting. NOTE: local IDF patch — an IDF
+     upgrade/reinstall wipes it; reapply if so.
+  2. Heap relief: `DNS_FWD_QUEUE_LEN` back to 8 (the 1.5 s timeout already
+     fixed the stall; 16-deep cost ~4 KB heap).
+- **iPhone "unable to join network" regression fixed:** removing the permanent
+  `ESP_COEX_PREFER_WIFI` (done in the 2026-08-23 session) starved EAPOL once
+  BT was active — reason=2 deauth bursts. Restored `PREFER_WIFI`; the ADR
+  experiment showed it costs nothing for BT throughput.
+- **TX wedge self-recovery added** (`main/resilience.c`): if the TX ring
+  holds data (`depth>0`) but `sent` stops advancing for
+  `RESILIENCE_TX_STALL_MS` (15 s), force a PAN reconnect (non-blocking deferred
+  stop/start), rate-limited to one bounce per
+  `RESILIENCE_TX_STALL_COOLDOWN_MS` (120 s). Converts "wedged until manual
+  phone toggle" into a ~20 s hiccup. Uses new
+  `bnep_transport_get_tx_stats()` accessor.
+
+Everything below from the 2026-08-23 ADR still stands; what changed is only
+that "next lever is non-firmware" was tested and closed — the lever is
+Android itself, which we cannot change. The self-recovery above is the
+firmware-side mitigation.
 
 **`docs/2026-08-23_bt-throughput-wedge-is-phone-side.md`** (ADR)
 
@@ -23,12 +53,9 @@ Key points:
 - The bridge's own resilience probe logged `BT link ALIVE (cellular dead —
   patient)` during wedged runs — ACL up, keepalives flowing, uplink dead.
 - Decision: **no BTstack port** (a rewrite fixes nothing — same controller,
-  same phone, same uplink ceiling). Firmware is at its ceiling, ~35% packet
-  success under sustained load on this phone/carrier combo.
-- **Next lever is non-firmware:** disable Android **Data Saver / Battery
-  Saver** on the Pixel 7 Pro and re-run the ~60 s `ping 8.8.8.8` load test.
-  If the number is unchanged, it is a carrier-level tethering cap and ~35%
-  is the true ceiling. Firmware work on throughput is then DONE.
+  same phone, same uplink ceiling).
+- **Landed and kept:** PREFER_BT experiment (later reverted — see above),
+  QoS 0x40, dedicated TX task, DNS forwarder timeout reduction.
 
 ## What this device does
 
@@ -159,8 +186,10 @@ same for `L2CAP_CBB_DEFAULT_DATA_RATE_BUFF_QUOTA=2` and `VFS_WRITE_TIMEOUT=500`.
 
 ## Next steps
 
-1. **Commit** the current working tree (TX task, tuning, ADR, this file).
-2. **Phone-side test:** disable Data Saver / Battery Saver on the Pixel 7 Pro,
-   re-run the 60 s ping load test, compare against the ~35% baseline.
-3. If unchanged → carrier tethering cap; firmware is done. If improved →
-   re-open throughput work with the `txstat`/`dnsstat`/resilience telemetry.
+1. **Field-test the wedge self-recovery:** sustained iPhone browsing; expect
+   `TX wedge: sent frozen ...` → PAN reconnect → browsing resumes after ~20 s.
+   If the phone's throttle is sticky across bounces, expect a hiccup every
+   ~2-3 min (cooldown-limited) instead of permanent death.
+2. **Commit** everything (wedge recovery + this file).
+3. Only re-open throughput work if the phone/OS changes (different phone,
+   Android update, different tethering app).

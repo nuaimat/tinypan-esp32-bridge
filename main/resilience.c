@@ -87,6 +87,14 @@ static bool     s_pan_reconnect_pending = false;
 static uint8_t  s_pan_reconnect_stage = 0;   /* 0 = not started, 1 = stopped & waiting */
 static uint32_t s_pan_reconnect_stop_ms = 0; /* when tinypan_stop() was called */
 
+/* TX wedge detection state (see RESILIENCE_TX_STALL_MS in resilience.h) */
+static uint32_t s_tx_last_sent      = 0;
+static uint32_t s_tx_stall_since_ms = 0;
+static uint32_t s_last_tx_wedge_ms  = 0;
+
+/* From tinypan_bnep_transport.c (same extern pattern as main.c) */
+extern void bnep_transport_get_tx_stats(uint32_t* sent_ok, uint32_t* depth);
+
 /* How long to wait for the BT stack to finish tearing down before restarting
  * PAN. Matches the original 3000ms blocking delay. */
 #define RESILIENCE_PAN_RECONNECT_TEARDOWN_MS  3000
@@ -468,6 +476,9 @@ esp_err_t resilience_init(void)
     s_pan_reconnect_pending = false;
     s_pan_reconnect_stage = 0;
     s_pan_reconnect_stop_ms = 0;
+    s_tx_last_sent = 0;
+    s_tx_stall_since_ms = 0;
+    s_last_tx_wedge_ms = 0;
     s_initialized = true;
 
     /* Create the mutex protecting probe result state. */
@@ -576,6 +587,37 @@ void resilience_process(void)
     if (now - s_last_dns_refresh_ms >= RESILIENCE_DNS_REFRESH_MS) {
         s_last_dns_refresh_ms = now;
         refresh_dns_forward_server();
+    }
+
+    /* ── TX wedge self-recovery ──────────────────────────────── */
+    /* Phone-side BT-PAN throttling can stall TX indefinitely while the
+     * ACL stays alive; probes then fail in "patient" mode which by design
+     * never reconnects. Signature: TX ring holds data (depth > 0) but the
+     * transport's sent counter stops advancing. A PAN bounce reliably
+     * restores flow, so force one after RESILIENCE_TX_STALL_MS of stall
+     * (rate-limited by RESILIENCE_TX_STALL_COOLDOWN_MS). */
+    {
+        uint32_t sent = 0, depth = 0;
+        bnep_transport_get_tx_stats(&sent, &depth);
+        if (depth == 0 || s_reconnect_in_progress || s_pan_reconnect_pending) {
+            s_tx_last_sent = sent;
+            s_tx_stall_since_ms = 0;
+        } else if (sent != s_tx_last_sent) {
+            s_tx_last_sent = sent;
+            s_tx_stall_since_ms = 0;
+        } else if (s_tx_stall_since_ms == 0) {
+            s_tx_stall_since_ms = now;
+        } else if (now - s_tx_stall_since_ms >= RESILIENCE_TX_STALL_MS &&
+                   now - s_last_tx_wedge_ms >= RESILIENCE_TX_STALL_COOLDOWN_MS) {
+            ESP_LOGW(TAG, "TX wedge: sent frozen for %lu ms with depth=%lu — "
+                     "forcing PAN reconnect (phone-side BT-PAN stall)",
+                     (unsigned long)(now - s_tx_stall_since_ms),
+                     (unsigned long)depth);
+            s_last_tx_wedge_ms = now;
+            s_tx_stall_since_ms = 0;
+            s_probe_failures = 0;
+            s_pan_reconnect_pending = true;
+        }
     }
 
     /* Upstream connectivity probe (async, non-blocking) */

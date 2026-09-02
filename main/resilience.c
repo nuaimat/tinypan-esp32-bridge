@@ -93,8 +93,7 @@ static uint32_t s_tx_stall_since_ms = 0;
 static uint32_t s_last_tx_wedge_ms  = 0;
 static uint32_t s_traffic_adv_ms    = 0;  /* last time TX sent counter advanced */
 
-/* From tinypan_bnep_transport.c (same extern pattern as main.c) */
-extern void bnep_transport_get_tx_stats(uint32_t* sent_ok, uint32_t* depth);
+#include "tinypan_internal.h"  /* bnep_transport_get_tx_stats() */
 
 /* How long to wait for the BT stack to finish tearing down before restarting
  * PAN. Matches the original 3000ms blocking delay. */
@@ -598,16 +597,14 @@ void resilience_process(void)
      * restores flow, so force one after RESILIENCE_TX_STALL_MS of stall
      * (rate-limited by RESILIENCE_TX_STALL_COOLDOWN_MS). */
     {
-        uint32_t sent = 0, depth = 0;
-        bnep_transport_get_tx_stats(&sent, &depth);
-        if (sent != s_tx_last_sent) {
+        tinypan_tx_stats_t tx;
+        bnep_transport_get_tx_stats(&tx);
+        if (tx.sent_ok != s_tx_last_sent) {
             s_traffic_adv_ms = now;  /* TX active — used by the STALLED threshold */
         }
-        if (depth == 0 || s_reconnect_in_progress || s_pan_reconnect_pending) {
-            s_tx_last_sent = sent;
-            s_tx_stall_since_ms = 0;
-        } else if (sent != s_tx_last_sent) {
-            s_tx_last_sent = sent;
+        if (tx.depth == 0 || s_reconnect_in_progress || s_pan_reconnect_pending ||
+            tx.sent_ok != s_tx_last_sent) {
+            s_tx_last_sent = tx.sent_ok;
             s_tx_stall_since_ms = 0;
         } else if (s_tx_stall_since_ms == 0) {
             s_tx_stall_since_ms = now;
@@ -616,7 +613,7 @@ void resilience_process(void)
             ESP_LOGW(TAG, "TX wedge: sent frozen for %lu ms with depth=%lu — "
                      "forcing PAN reconnect (phone-side BT-PAN stall)",
                      (unsigned long)(now - s_tx_stall_since_ms),
-                     (unsigned long)depth);
+                     (unsigned long)tx.depth);
             s_last_tx_wedge_ms = now;
             s_tx_stall_since_ms = 0;
             s_probe_failures = 0;
@@ -647,9 +644,6 @@ void resilience_process(void)
                      (unsigned long)(now - s_probe_started_ms));
             if (s_probe_state_mutex != NULL &&
                 xSemaphoreTake(s_probe_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                s_probe_busy = false;
-                s_probe_done = false;
-                s_probe_result = false;
                 /* Delete the hung task while holding the mutex. The probe
                  * task clears s_probe_task_handle and self-deletes under this
                  * same mutex, so it cannot be mid-cleanup while we delete it. */
@@ -658,10 +652,6 @@ void resilience_process(void)
                     s_probe_task_handle = NULL;
                 }
                 xSemaphoreGive(s_probe_state_mutex);
-            } else {
-                s_probe_busy = false;
-                s_probe_done = false;
-                s_probe_result = false;
             }
         } else {
             return;

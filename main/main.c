@@ -484,13 +484,10 @@ void app_main(void) {
             uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
             if (now_ms - s_last_heap_log_ms >= 10000) {
                 s_last_heap_log_ms = now_ms;
-                extern void bnep_transport_log_stats(void);
-                extern uint32_t hal_bt_debug_tx_complete_max_lat_us(void);
-                ESP_LOGI(TAG, "heap: free=%lu min=%lu largest=%u txc_lat_max=%luus",
+                ESP_LOGI(TAG, "heap: free=%lu min=%lu largest=%u",
                          (unsigned long)esp_get_free_heap_size(),
                          (unsigned long)esp_get_minimum_free_heap_size(),
-                         heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
-                         (unsigned long)hal_bt_debug_tx_complete_max_lat_us());
+                         heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
                 bnep_transport_log_stats();
             }
         }

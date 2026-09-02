@@ -51,15 +51,11 @@ extern "C"
  *  quiet) yet upstream is dead. The 15-failure grace exists for cellular
  *  dead spots when nobody is being served; with an active client, 5
  *  minutes of dead internet is worse than a ~20s PAN bounce. */
-#ifndef RESILIENCE_PROBE_FAIL_THRESHOLD_STALLED
 #define RESILIENCE_PROBE_FAIL_THRESHOLD_STALLED 4
-#endif
 
 /** How recently TX traffic must have advanced for a client to count as
  *  "active" for the STALLED threshold (ms). */
-#ifndef RESILIENCE_TRAFFIC_ACTIVE_MS
 #define RESILIENCE_TRAFFIC_ACTIVE_MS 60000
-#endif
 
 /** If the system has been continuously offline (no IP / not ONLINE) for
  *  this long, reboot the ESP32 as a last-resort recovery (ms). */
@@ -99,15 +95,11 @@ extern "C"
  *  holds data (depth>0) but the transport's sent counter stops advancing.
  *  If the stall lasts this long, force a PAN reconnect — a bounce
  *  reliably restores flow. */
-#ifndef RESILIENCE_TX_STALL_MS
 #define RESILIENCE_TX_STALL_MS          15000
-#endif
 
 /** Minimum interval between wedge-triggered PAN reconnects, so a phone
  *  that keeps stalling doesn't cause reconnect thrash. */
-#ifndef RESILIENCE_TX_STALL_COOLDOWN_MS
 #define RESILIENCE_TX_STALL_COOLDOWN_MS 120000
-#endif
 
 /* ── API ───────────────────────────────────────────────────────── */
 

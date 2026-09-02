@@ -14,6 +14,8 @@
 #include "wifi_ap.h"
 #include "esp_event.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "esp_gap_bt_api.h"
 #include "router_config.h"
 #include "wifi_config.h"
@@ -63,6 +65,11 @@ static bool              s_handshake_completed = false;  /* set by STACONNECTED 
 #define WIFI_AP_BT_PAUSE_MS  10000
 #define WIFI_AP_BOOST_MS     12000  /* covers EAPOL + retry window */
 
+/* All state access goes through this: take the mutex (10ms cap — these are
+ * short critical sections on a dual-core box), run fn(), give. The bool
+ * return lets callers skip work that only makes sense when the lock was held.
+ * A missed 10ms window means some other task held it >10ms, which is already
+ * a bug — log it once and move on rather than retrying. */
 /* Forward declaration */
 static void wifi_ap_restore_wifi_ps(void);
 
@@ -76,13 +83,13 @@ static void wifi_ap_event_handler(void *arg, esp_event_base_t event_base,
         ESP_LOGI(TAG, "Station connected: %02x:%02x:%02x:%02x:%02x:%02x, AID=%d",
                  event->mac[0], event->mac[1], event->mac[2],
                  event->mac[3], event->mac[4], event->mac[5], event->aid);
-        /* Signal handshake completion and restore PS atomically */
+        /* Signal handshake completion and clear the pause atomically */
         if (xSemaphoreTake(s_wifi_state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
             s_handshake_completed = true;  /* signal BT reconnect in main loop */
             s_bt_pause_until_ms = 0;       /* station connected — resume keepalive */
             xSemaphoreGive(s_wifi_state_mutex);
         } else {
-            ESP_LOGW(TAG, "Could not acquire WiFi state mutex in STACONNECTED handler");
+            ESP_LOGW(TAG, "WiFi state mutex busy — skipping STACONNECTED update");
         }
         wifi_ap_restore_wifi_ps();  /* handshake done — restore BT coexistence */
     } else if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
@@ -91,12 +98,11 @@ static void wifi_ap_event_handler(void *arg, esp_event_base_t event_base,
                  event->mac[0], event->mac[1], event->mac[2],
                  event->mac[3], event->mac[4], event->mac[5], event->aid, event->reason);
         if (event->reason == WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT) {
-            int64_t now = esp_timer_get_time() / 1000;
             if (xSemaphoreTake(s_wifi_state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                s_bt_pause_until_ms = now + WIFI_AP_BT_PAUSE_MS;
+                s_bt_pause_until_ms = esp_timer_get_time() / 1000 + WIFI_AP_BT_PAUSE_MS;
                 xSemaphoreGive(s_wifi_state_mutex);
             } else {
-                ESP_LOGW(TAG, "Could not acquire WiFi state mutex in STADISCONNECTED handler");
+                ESP_LOGW(TAG, "WiFi state mutex busy — skipping STADISCONNECTED update");
             }
             ESP_LOGI(TAG, "Handshake timeout — pausing BT keepalive for %dms",
                      WIFI_AP_BT_PAUSE_MS);
@@ -123,29 +129,26 @@ bool wifi_ap_bt_pause_active(void)
 
 void wifi_ap_bt_pause(uint32_t duration_ms)
 {
-    int64_t now = esp_timer_get_time() / 1000;
     if (xSemaphoreTake(s_wifi_state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-        s_bt_pause_until_ms = now + duration_ms;
+        s_bt_pause_until_ms = esp_timer_get_time() / 1000 + duration_ms;
         xSemaphoreGive(s_wifi_state_mutex);
     } else {
-        ESP_LOGW(TAG, "Could not acquire WiFi state mutex in bt_pause");
+        ESP_LOGW(TAG, "WiFi state mutex busy — skipping bt_pause update");
     }
 }
 
 void wifi_ap_boost_wifi_for_handshake(uint32_t duration_ms)
 {
-    int64_t now = esp_timer_get_time() / 1000;
-
     bool should_boost = false;
     if (xSemaphoreTake(s_wifi_state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-        s_wifi_boost_until_ms = now + duration_ms;
+        s_wifi_boost_until_ms = esp_timer_get_time() / 1000 + duration_ms;
         if (!s_wifi_boosted) {
             s_wifi_boosted = true;
             should_boost = true;
         }
         xSemaphoreGive(s_wifi_state_mutex);
     } else {
-        ESP_LOGW(TAG, "Could not acquire WiFi state mutex in boost_wifi_for_handshake");
+        ESP_LOGW(TAG, "WiFi state mutex busy — skipping boost update");
     }
 
     if (should_boost) {
@@ -192,6 +195,9 @@ static void wifi_ap_apply_ps_restore(void)
 static void wifi_ap_restore_wifi_ps(void)
 {
     bool was_boosted = false;
+    /* Decide AND clear atomically under the mutex so a concurrent
+     * wifi_ap_boost_wifi_for_handshake() (new station) cannot interleave
+     * between the expiry check and the restore. */
     if (xSemaphoreTake(s_wifi_state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
         if (s_wifi_boosted) {
             s_wifi_boosted = false;
@@ -212,12 +218,10 @@ void wifi_ap_poll_handshake_timeout(void)
      * wifi_ap_boost_wifi_for_handshake() (new station) cannot interleave
      * between the expiry check and the restore. */
     if (xSemaphoreTake(s_wifi_state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-        if (s_wifi_boosted) {
-            int64_t now = esp_timer_get_time() / 1000;
-            if (now >= s_wifi_boost_until_ms) {
-                s_wifi_boosted = false;
-                should_restore = true;
-            }
+        if (s_wifi_boosted &&
+            esp_timer_get_time() / 1000 >= s_wifi_boost_until_ms) {
+            s_wifi_boosted = false;
+            should_restore = true;
         }
         xSemaphoreGive(s_wifi_state_mutex);
     }

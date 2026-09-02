@@ -60,25 +60,16 @@ esp_err_t get_dhcp_reservations() {
     }
     err = nvs_get_blob(nvs, "dhcp_res", NULL, &len);
     if (err == ESP_OK) {
+        /* Boot-time-only path: the lock is only held for the NVS read itself. */
+        reservations_lock();
         if (len != DHCP_RES_SIZE) {
             /* Stored blob has wrong size — reset to avoid stale data */
-            reservations_lock();
             memset(dhcp_reservations, 0, DHCP_RES_SIZE);
-            reservations_unlock();
             err = ESP_ERR_NVS_INVALID_LENGTH;
-        } else {
-            /* Read into a local buffer WITHOUT the lock so NVS flash I/O
-             * doesn't block DHCP lookups, then publish under the lock. */
-            struct dhcp_reservation_entry buf[MAX_DHCP_RESERVATIONS];
-            err = nvs_get_blob(nvs, "dhcp_res", buf, &len);
-            reservations_lock();
-            if (err == ESP_OK) {
-                memcpy(dhcp_reservations, buf, sizeof(buf));
-            } else {
-                memset(dhcp_reservations, 0, sizeof(buf));
-            }
-            reservations_unlock();
+        } else if ((err = nvs_get_blob(nvs, "dhcp_res", dhcp_reservations, &len)) != ESP_OK) {
+            memset(dhcp_reservations, 0, DHCP_RES_SIZE);
         }
+        reservations_unlock();
     }
     nvs_close(nvs);
 

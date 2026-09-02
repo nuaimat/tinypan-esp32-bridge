@@ -46,19 +46,14 @@ static void tp_tx_task_fn(void* arg);
 /* ── TX pipeline diagnostics ─────────────────────────────────────
  * Counters at each stage of the WiFi->BT forwarding path to locate
  * where packets are dropped or stalled:
- *   enq_ok       - packets accepted into the TinyPAN TX ring
  *   enq_full     - packets rejected because the ring was full (lwIP ERR_MEM)
  *   sent_ok      - successful hal_bt_l2cap_send_iovec() calls
  *   send_busy    - send returned "congested/busy" (VFS queue full or timeout)
  *   send_err     - hard send failures (packet dropped)
- *   tx_complete  - TX_COMPLETE events consumed (ring advanced)
- *   drain_calls  - times the drain function ran
- *   drain_inflight - drain aborted early: previous packet still in flight
  *   write_max_ms - worst-case duration of a single send call (blocking write)
  */
 static struct {
-    uint32_t enq_ok, enq_full, sent_ok, send_busy, send_err;
-    uint32_t tx_complete, drain_calls, drain_inflight;
+    uint32_t enq_full, sent_ok, send_busy, send_err;
     uint32_t write_max_ms;
 } s_txstat;
 
@@ -173,53 +168,47 @@ static bnep_tx_job_t s_bnep_tx_queue[TINYPAN_TX_QUEUE_LEN];
 static uint8_t s_bnep_tx_head = 0;
 static uint8_t s_bnep_tx_tail = 0;
 
-void bnep_transport_log_stats(void) {
-    unsigned depth = (unsigned)((s_bnep_tx_tail + TINYPAN_TX_QUEUE_LEN - s_bnep_tx_head)
-                                % TINYPAN_TX_QUEUE_LEN);
-    bool head_in_flight = (s_bnep_tx_head != s_bnep_tx_tail) &&
-                          s_bnep_tx_queue[s_bnep_tx_head].in_flight;
-    TINYPAN_LOG_INFO("txstat: enq=%u full=%u sent=%u busy=%u err=%u "
-                     "done=%u drains=%u infl_wait=%u wmax=%ums depth=%u infl=%d",
-                     (unsigned)s_txstat.enq_ok, (unsigned)s_txstat.enq_full,
-                     (unsigned)s_txstat.sent_ok, (unsigned)s_txstat.send_busy,
-                     (unsigned)s_txstat.send_err, (unsigned)s_txstat.tx_complete,
-                     (unsigned)s_txstat.drain_calls, (unsigned)s_txstat.drain_inflight,
-                     (unsigned)s_txstat.write_max_ms, depth, (int)head_in_flight);
-    s_txstat.write_max_ms = 0;
+/* One accessor for both consumers: the periodic txstat log and the
+ * resilience watchdog's TX-wedge detector (sent_ok advancing = data is
+ * flowing; depth>0 with sent frozen = wedge). */
+void bnep_transport_get_tx_stats(tinypan_tx_stats_t* stats) {
+    if (stats == NULL) return;
+    stats->enq_full     = s_txstat.enq_full;
+    stats->sent_ok      = s_txstat.sent_ok;
+    stats->send_busy    = s_txstat.send_busy;
+    stats->send_err     = s_txstat.send_err;
+    stats->write_max_ms = s_txstat.write_max_ms;
+    stats->depth        = (uint32_t)((s_bnep_tx_tail + TINYPAN_TX_QUEUE_LEN - s_bnep_tx_head)
+                                      % TINYPAN_TX_QUEUE_LEN);
 }
 
-/* Lightweight accessor for the resilience watchdog's TX-wedge detector.
- * sent_ok advancing = data is flowing; depth>0 with sent frozen = wedge. */
-void bnep_transport_get_tx_stats(uint32_t* sent_ok, uint32_t* depth) {
-    if (sent_ok) {
-        *sent_ok = s_txstat.sent_ok;
-    }
-    if (depth) {
-        *depth = (uint32_t)((s_bnep_tx_tail + TINYPAN_TX_QUEUE_LEN - s_bnep_tx_head)
-                            % TINYPAN_TX_QUEUE_LEN);
-    }
+void bnep_transport_log_stats(void) {
+    tinypan_tx_stats_t s;
+    bnep_transport_get_tx_stats(&s);
+    TINYPAN_LOG_INFO("txstat: full=%u sent=%u busy=%u err=%u wmax=%ums depth=%u",
+                     (unsigned)s.enq_full, (unsigned)s.sent_ok,
+                     (unsigned)s.send_busy, (unsigned)s.send_err,
+                     (unsigned)s.write_max_ms, (unsigned)s.depth);
+    s_txstat.write_max_ms = 0;
 }
 
 /* Must be exposed to drain the BNEP tx queue */
 void bnep_transport_drain_tx_queue(void) {
     hal_mutex_lock(s_bnep_tx_mutex);
-    s_txstat.drain_calls++;
-    
+
     if (!bnep_drain_control_tx_queue()) {
         hal_mutex_unlock(s_bnep_tx_mutex);
         return;
     }
-    
+
     if (s_bnep_tx_head == s_bnep_tx_tail) {
         hal_mutex_unlock(s_bnep_tx_mutex);
         return;
     }
-    
-#if TINYPAN_HAL_SYNCHRONOUS_TX
+
     /* Synchronous HAL: drain the whole queue in one pass. Blocking on write()
      * is harmless here because this runs in the dedicated tp_tx task, not the
      * app main loop. */
-#endif
     while (s_bnep_tx_head != s_bnep_tx_tail) {
         if (!hal_bt_l2cap_can_send()) {
             hal_bt_l2cap_request_can_send_now();
@@ -245,7 +234,6 @@ void bnep_transport_drain_tx_queue(void) {
                 if (q) pbuf_free(q);
                 return; /* Stop draining until reconnection */
             }
-            s_txstat.drain_inflight++;
             break; /* Packet still legitimately in flight */
         }
         
@@ -436,7 +424,6 @@ void bnep_transport_flush_tx_queue(void) {
 
 static void bnep_transport_on_tx_complete(void) {
     hal_mutex_lock(s_bnep_tx_mutex);
-    s_txstat.tx_complete++;
     if (s_bnep_tx_head != s_bnep_tx_tail) {
         bnep_tx_job_t* job = &s_bnep_tx_queue[s_bnep_tx_head];
         if (job->in_flight) {
@@ -515,8 +502,7 @@ static int bnep_transport_output(struct netif* netif, struct pbuf* p) {
         hal_mutex_unlock(s_bnep_tx_mutex);
         return ERR_MEM;
     }
-    s_txstat.enq_ok++;
-    
+
     bnep_tx_job_t* job = &s_bnep_tx_queue[s_bnep_tx_tail];
     pbuf_ref(p);
     job->p = p;

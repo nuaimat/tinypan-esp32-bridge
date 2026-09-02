@@ -105,8 +105,6 @@ static portMUX_TYPE s_state_spinlock = portMUX_INITIALIZER_UNLOCKED;
 static volatile bool s_is_connected = false;
 static volatile int s_l2cap_fd = -1;           /* VFS file descriptor (-1 = invalid) */
 static bool s_tx_complete_pending = false;
-static int64_t s_tx_complete_set_us = 0;   /* when the pending flag was set */
-static uint32_t s_tx_complete_max_lat_us = 0; /* worst write->delivery latency */
 
 /* --- Negotiated MTU from OPEN_EVT --- */
 static uint16_t s_negotiated_mtu = TINYPAN_L2CAP_MTU;
@@ -449,14 +447,6 @@ uint32_t hal_bt_get_last_rx_ms(void) {
     return s_last_rx_ms;
 }
 
-/* Diagnostic: worst-case latency between a successful L2CAP write and the
- * deferred TX_COMPLETE delivery in hal_bt_poll(). Resets on read. */
-uint32_t hal_bt_debug_tx_complete_max_lat_us(void) {
-    uint32_t v = s_tx_complete_max_lat_us;
-    s_tx_complete_max_lat_us = 0;
-    return v;
-}
-
 void hal_bt_poll(void) {
     if (!s_hal_initialized) return;
 
@@ -472,15 +462,11 @@ void hal_bt_poll(void) {
 
     /* Fire deferred completion events (Breaks recursion loop from app task) */
     bool tx_complete = false;
-    int64_t set_us = 0;
     portENTER_CRITICAL_SAFE(&s_state_spinlock);
     tx_complete = s_tx_complete_pending;
-    set_us = s_tx_complete_set_us;
     s_tx_complete_pending = false;
     portEXIT_CRITICAL_SAFE(&s_state_spinlock);
     if (tx_complete && s_event_cb) {
-        uint32_t lat = (uint32_t)(esp_timer_get_time() - set_us);
-        if (lat > s_tx_complete_max_lat_us) s_tx_complete_max_lat_us = lat;
         s_event_cb(HAL_L2CAP_EVENT_TX_COMPLETE, 0, s_event_cb_data);
     }
 
@@ -749,7 +735,6 @@ int hal_bt_l2cap_send_iovec(const tinypan_iovec_t* iov, uint16_t iov_count) {
     s_tx_frames++;
     s_tx_bytes += (uint32_t)written;
     s_tx_complete_pending = true;  /* defer TX_COMPLETE to hal_bt_poll */
-    s_tx_complete_set_us = esp_timer_get_time();
     portEXIT_CRITICAL_SAFE(&s_state_spinlock);
 
     return 0;

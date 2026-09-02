@@ -178,7 +178,6 @@ static err_t tinypan_netif_init_callback(struct netif* netif) {
 static err_t tinypan_netif_linkoutput(struct netif* netif, struct pbuf* p) {
     const tinypan_transport_t* transport = tinypan_transport_get();
     if (transport && transport->output) {
-        TINYPAN_LOG_DEBUG("netif TX: %u bytes", (unsigned)p->tot_len);
         return transport->output(netif, p);
     }
     TINYPAN_LOG_WARN("netif TX: no transport output, dropping %u bytes", (unsigned)p->tot_len);
@@ -420,8 +419,7 @@ void tinypan_netif_input(const uint8_t* dst_addr, const uint8_t* src_addr,
     }
 
     uint16_t total_len = 14 + payload_len;
-    TINYPAN_LOG_DEBUG("netif RX: %u bytes", total_len);
-    
+
     /* Allocate a pbuf to hold the received data directly into lwIP pool */
 #if defined(ETH_PAD_SIZE) && ETH_PAD_SIZE > 0
     struct pbuf* p = pbuf_alloc(PBUF_RAW, total_len + ETH_PAD_SIZE, PBUF_POOL);

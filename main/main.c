@@ -425,12 +425,21 @@ void app_main(void) {
                 }
             }
         }
+        /* Name is optional in NVS — fall back to the BDA so logs are identifiable */
+        char dev_id[32];
+        if (bonded.name[0]) {
+            snprintf(dev_id, sizeof(dev_id), "%s", bonded.name);
+        } else {
+            snprintf(dev_id, sizeof(dev_id), "%02x:%02x:%02x:%02x:%02x:%02x",
+                     bonded.bda[0], bonded.bda[1], bonded.bda[2],
+                     bonded.bda[3], bonded.bda[4], bonded.bda[5]);
+        }
         if (has_bonded) {
             ESP_LOGI(TAG, "Found bonded device \"%s\" — will auto-connect after delay",
-                     bonded.name);
+                     dev_id);
         } else {
             ESP_LOGW(TAG, "Saved device \"%s\" no longer bonded — skipping",
-                     bonded.name);
+                     dev_id);
         }
     } else {
         ESP_LOGI(TAG, "No bonded device in NVS — waiting for pairing");

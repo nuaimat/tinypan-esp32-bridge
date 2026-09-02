@@ -54,7 +54,10 @@ static int s_fwd_sock = -1;                      /* UDP socket for forwarding + 
 /* Queue to pass DNS queries from lwIP callback to forward task.
  * sendto() cannot be called from the tcpip_thread (it posts back to
  * the same thread), so we defer to a separate task. */
-#define DNS_FWD_QUEUE_LEN 8
+/* ponytail: queue of 8 overflows under a bursty client (Mac retry storm)
+ * because the single fwd_task is serialized on one socket with SO_RCVTIMEO;
+ * 32 covers realistic bursts without meaningful RAM cost (~16 KB). */
+#define DNS_FWD_QUEUE_LEN 32
 typedef struct {
     uint8_t data[512];
     uint16_t len;
@@ -134,7 +137,11 @@ static void fwd_task(void *arg)
                           (struct sockaddr *)&dst, sizeof(dst));
         if (sent <= 0) {
             s_dnsstat.sendto_err++;
-            ESP_LOGW(TAG, "DNS forward sendto failed: errno=%d", errno);
+            /* errno 12 (ENOMEM): BT link is congested and lwIP has no pbuf
+             * to send — serves no purpose to spam the console every ~5ms. */
+            if (errno != ENOMEM) {
+                ESP_LOGW(TAG, "DNS forward sendto failed: errno=%d", errno);
+            }
             dns_stat_maybe_log();
             continue;
         }

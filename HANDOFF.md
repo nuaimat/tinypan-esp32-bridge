@@ -1,5 +1,76 @@
 # TinyPAN Bridge — Status Handoff
 
+**Date:** 2026-09-01 (supersedes 2026-08-27 session)
+**Repo:** `/Users/nuaimat/code/esp_others/tinypan`
+**Branch:** `v0.3-dev`
+
+## Session 2026-09-01 — Mac-client heap exhaustion + log-spam cleanup
+
+**The bug (this session's whole point):** when a real Mac joined the AP, it
+disconnected after ~30-40 s of use with a wall of fast-scrolling log noise.
+Two passes, two distinct defects:
+
+### Pass 1 — over-engineering cleanup (committed `f57e2aa`)
+
+`ponytail-review` of `v0.3-dev` vs `main`, then applied. Net -43 lines, no
+behavior change:
+
+- Merged `bnep_transport_log_stats()` + `bnep_transport_get_tx_stats()` into
+  one struct accessor declared in `tinypan_internal.h` (was two `extern`-wired
+  ad-hoc APIs). Dropped 4 log-only counters (`enq_ok`, `tx_complete`,
+  `drain_calls`, `drain_inflight`).
+- Deleted the `hal_bt_debug_tx_complete_max_lat_us()` TX-latency diagnostic
+  (getter + 2 statics + timestamp reads) — only consumer was a log line.
+- `resilience.h`: new tunables to plain `#define` (no override mechanism).
+- `dhcp_manager.c`: NVS read straight into the table under lock (dropped the
+  lock-free stack-buffer copy — boot-time-only path).
+- `captive_dns.c`: dropped the unlogged `queue_full` counter.
+- `tinypan.c`: `tinypan_internal_clear_ip()` early-returns when no IP was ever
+  assigned — kills the false `[WARN] IP lost` + `IP_LOST` event on every
+  initial link-up.
+- `main.c`: bonded-device logs fall back to BDA when the NVS name is empty.
+
+### Pass 2 — Mac disconnect (root cause = heap exhaustion)
+
+First log (`/tmp/logs.txt`) showed `DNS fwd queue full` ×422 + `errno=12` ×184
++ `Unknown BNEP packet type` (frame desync) + heap min **5.4 KB**. Initial
+diagnosis over-weighted the DNS queue, so `DNS_FWD_QUEUE_LEN` 8→32 and 5
+per-frame `[DEBUG]` logs were deleted.
+
+Second log (`/tmp/log2`, after flash) proved the real root cause:
+
+```
+10.0s  E BT_OSI: malloc failed (GAP_ConnWriteData size=2048)
+10.7s  heap: free=2948  min=964      ← heap exhausted
+       E l2cap_vfs_write exit for time out  (43×)
+       W DNS sendto failed: errno=12        (199×)
+       → Mac's DNS dies → SERVFAIL → Mac gives up
+```
+
+The Mac's AMPDU-aggregated traffic (`winSize:64`, `ba-add` frames) drove the
+WiFi→BT forwarding path hard enough to exhaust heap. The BT stack couldn't get
+a single GAP TX buffer, L2CAP write starved, and the DNS forwarder (which needs
+pbufs) collapsed into the ENOMEM storm.
+
+**Fix:** halved the WiFi dynamic buffer counts in `sdkconfig.defaults`
+(`CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM` 16→8, `..._TX_BUFFER_NUM` 16→8,
+`CONFIG_ESP_WIFI_MGMT_SBUF_NUM` 16→8) — frees ~25 KB, the exact margin between
+"964 bytes free" and "works". Also silenced the `errno=12` log (kept the
+counter) and deleted the `L2CAP can send now` debug line.
+
+**STILL TO VERIFY:** re-flash and re-test with the Mac. Watch `heap: free=..
+min=..` during the traffic burst — `min` must now stay ≥~20 KB. If it still
+bottoms out, the next lever is `CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM` 10→8,
+then the L2CAP TX quota.
+
+**Also note:** the `DNS_FWD_QUEUE_LEN` 8→32 change from pass 2 was kept (it is
+genuinely useful for burst absorption after the heap fix), but it costs ~16 KB
+— re-evaluate if the heap fix alone clears the disconnect.
+
+---
+
+<details><summary><b>Legacy handoff (2026-08-27 and earlier) — kept for history</b></summary>
+
 **Date:** 2026-08-27 (supersedes 2026-08-22/23 sessions)
 **Repo:** `/Users/nuaimat/code/esp_others/tinypan` (HEAD `6a539a9`; the TX-task + tuning changes below are uncommitted local changes)
 **Hardware:** ESP32-D0WD-V3 rev v3.1 on `/dev/cu.usbserial-0001` (a.k.a. `/dev/cu.SLAB_USBtoUART`), 115200 baud
@@ -193,3 +264,5 @@ same for `L2CAP_CBB_DEFAULT_DATA_RATE_BUFF_QUOTA=2` and `VFS_WRITE_TIMEOUT=500`.
 2. **Commit** everything (wedge recovery + this file).
 3. Only re-open throughput work if the phone/OS changes (different phone,
    Android update, different tethering app).
+
+</details>

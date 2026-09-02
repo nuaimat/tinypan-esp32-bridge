@@ -59,9 +59,7 @@ static struct {
 
 static void bnep_transport_frame_cb(const bnep_ethernet_frame_t* frame, void* user_data) {
     (void)user_data;
-    TINYPAN_LOG_DEBUG("transport_bnep: Received frame type=0x%04X len=%u",
-                       frame->ethertype, frame->payload_len);
-    
+
 #if TINYPAN_ENABLE_LWIP
     if (frame != NULL) {
         tinypan_netif_input(frame->dst_addr, frame->src_addr, frame->ethertype,
@@ -489,9 +487,6 @@ static int bnep_transport_output(struct netif* netif, struct pbuf* p) {
     }
 
     uint8_t bnep_hdr_len = bnep_get_ethernet_header_len(dst_addr, src_addr);
-
-    TINYPAN_LOG_DEBUG("bnep_output: ethertype=0x%04X, pbuf_len=%u, hdr_len=%u",
-                       ethertype, (unsigned)p->tot_len, (unsigned)bnep_hdr_len);
 
     /* Enqueue the job */
     hal_mutex_lock(s_bnep_tx_mutex);

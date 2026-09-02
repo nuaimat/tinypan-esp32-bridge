@@ -786,9 +786,6 @@ static void handle_ethernet_frame(const uint8_t* data, uint16_t len) {
         return;
     }
     
-    TINYPAN_LOG_DEBUG("Received frame: ethertype=0x%04X len=%u", 
-                       frame.ethertype, frame.payload_len);
-    
     if (s_frame_callback) {
         s_frame_callback(&frame, s_frame_callback_user_data);
     }

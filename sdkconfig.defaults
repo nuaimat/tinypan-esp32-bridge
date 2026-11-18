@@ -1,5 +1,20 @@
 CONFIG_FREERTOS_HZ=1000
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+# ── Dual-core split (EXPERIMENT) ─────────────────────────────────
+# Espressif's RF Coexistence guide explicitly recommends running the
+# WiFi stack and the BT controller+host on DIFFERENT CPUs. The stock
+# config piled everything on core 0 (BT ctrl 0, Bluedroid 0, WiFi 0,
+# main task CPU0) while core 1 idled. Split:
+#   core 0 = BT controller + Bluedroid host (+ floating tp_tx/RX tasks)
+#   core 1 = WiFi task + lwIP tcpip + app main loop
+# Single radio: RF time-slicing/coex arbitration is unchanged; this
+# removes CPU contention only. Needs hardware A/B test (EAPOL, ping
+# jitter, wedge frequency) before merging to v0.3-dev.
+CONFIG_BTDM_CTRL_PINNED_TO_CORE_0=y
+CONFIG_BT_BLUEDROID_PINNED_TO_CORE_0=y
+CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_1=y
+CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU1=y
+CONFIG_ESP_MAIN_TASK_AFFINITY_CPU1=y
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
 CONFIG_LWIP_MAX_SOCKETS=16
 CONFIG_LWIP_TCPIP_TASK_STACK_SIZE=4096

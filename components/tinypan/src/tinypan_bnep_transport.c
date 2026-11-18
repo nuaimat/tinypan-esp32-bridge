@@ -40,6 +40,8 @@ __attribute__((weak)) bool wifi_ap_bt_pause_active(void) { return false; }
 static hal_mutex_t s_bnep_tx_mutex = NULL;
 static hal_semaphore_t s_bnep_tx_semaphore = NULL;  /* wake-up signal for tp_tx task */
 static TaskHandle_t s_tp_tx_task = NULL;            /* dedicated TX drain task */
+static volatile bool s_keepalive_due = false;  /* keepalive deferred to tp_tx (blocking write) */
+static uint32_t s_session_gen = 0;             /* bumped on disconnect; stale-write guard */
 
 static void tp_tx_task_fn(void* arg);
 
@@ -122,6 +124,8 @@ static void bnep_transport_on_connected(void) {
 }
 
 static void bnep_transport_on_disconnected(void) {
+    s_session_gen++;
+    s_keepalive_due = false;
     bnep_on_l2cap_disconnected();
 }
 
@@ -160,6 +164,7 @@ typedef struct {
     uint16_t iov_count;
     uint32_t sent_at_ms;
     bool in_flight;
+    bool writing;   /* send_iovec() in progress — pbuf must not be freed/reclaimed */
 } bnep_tx_job_t;
 
 static bnep_tx_job_t s_bnep_tx_queue[TINYPAN_TX_QUEUE_LEN];
@@ -230,6 +235,7 @@ void bnep_transport_drain_tx_queue(void) {
                  * We must tear down the entire link to safely cancel the hardware state. */
                 hal_bt_l2cap_disconnect();
                 if (q) pbuf_free(q);
+                hal_mutex_unlock(s_bnep_tx_mutex);
                 return; /* Stop draining until reconnection */
             }
             break; /* Packet still legitimately in flight */
@@ -287,12 +293,36 @@ void bnep_transport_drain_tx_queue(void) {
             TINYPAN_LOG_ERROR("transport_bnep: PBUF chain too long for iovec");
             result = -1;
         } else {
+            /* Mark the job as actively writing BEFORE releasing the mutex:
+             * flush_tx_queue() (disconnect, app task) must not free this
+             * pbuf while send_iovec() is copying from it, and must not
+             * advance head past it (the reclaim below owns that). */
+            uint32_t gen = s_session_gen;
+            job->writing = true;
             hal_mutex_unlock(s_bnep_tx_mutex);
             uint32_t t0 = hal_get_tick_ms();
             result = hal_bt_l2cap_send_iovec(job->iov, job->iov_count);
             uint32_t dt = hal_get_tick_ms() - t0;
             if (dt > s_txstat.write_max_ms) s_txstat.write_max_ms = dt;
             hal_mutex_lock(s_bnep_tx_mutex);
+            job->writing = false;
+            if (gen != s_session_gen) {
+                /* The link dropped while write() blocked (up to 40 s on
+                 * stock IDF). flush_tx_queue() stopped at this writing job,
+                 * so reclaim it and everything queued behind it — all belong
+                 * to the dead session and must not leak into the next one.
+                 * Without this, the success path below would double-free a
+                 * pbuf the flush already released and skip a live job. */
+                while (s_bnep_tx_head != s_bnep_tx_tail) {
+                    bnep_tx_job_t* j = &s_bnep_tx_queue[s_bnep_tx_head];
+                    if (j->in_flight) break;  /* async DMA: let TX timeout reclaim */
+                    struct pbuf* stale = j->p;
+                    j->p = NULL;
+                    s_bnep_tx_head = (s_bnep_tx_head + 1) % TINYPAN_TX_QUEUE_LEN;
+                    if (stale) pbuf_free(stale);
+                }
+                break;
+            }
         }
         
         if (result == 0) {
@@ -343,6 +373,15 @@ static void tp_tx_task_fn(void* arg) {
     (void)arg;
     for (;;) {
         hal_semaphore_take(s_bnep_tx_semaphore);
+        /* Send a due keepalive here, not in the app loop: hal_bt_l2cap_send()
+         * is a blocking VFS write() (up to 40 s on stock IDF under congestion). */
+        if (s_keepalive_due) {
+            s_keepalive_due = false;
+            if (bnep_is_connected() && !wifi_ap_bt_pause_active()) {
+                static const uint8_t keepalive_pkt[] = { 0x01, 0x02, 0x00, 0x00 };
+                hal_bt_l2cap_send(keepalive_pkt, sizeof(keepalive_pkt));
+            }
+        }
         bnep_transport_drain_tx_queue();
     }
 }
@@ -362,8 +401,13 @@ static void bnep_transport_process(void) {
         if (now - s_last_keepalive_ms > TINYPAN_BNEP_KEEPALIVE_MS) {
             if (!wifi_ap_bt_pause_active()) {
                 s_last_keepalive_ms = now;
-                static const uint8_t keepalive_pkt[] = { 0x01, 0x02, 0x00, 0x00 };
-                hal_bt_l2cap_send(keepalive_pkt, sizeof(keepalive_pkt));
+                /* Defer the blocking write() to tp_tx. On stock ESP-IDF a
+                 * congested L2CAP VFS queue blocks write() up to 40 s (the
+                 * VFS_WRITE_TIMEOUT -D override does NOT take effect — see
+                 * top-level CMakeLists.txt); that must never happen in the
+                 * app main loop, which owns hal_bt_poll and the watchdog. */
+                s_keepalive_due = true;
+                hal_semaphore_give(s_bnep_tx_semaphore);
             }
         }
     }
@@ -373,7 +417,7 @@ static void bnep_transport_process(void) {
     hal_mutex_lock(s_bnep_tx_mutex);
     if (s_bnep_tx_head != s_bnep_tx_tail) {
         bnep_tx_job_t* job = &s_bnep_tx_queue[s_bnep_tx_head];
-        if (job->in_flight) {
+        if (job->in_flight && !job->writing) {
             uint32_t now = hal_get_tick_ms();
             if (now - job->sent_at_ms > TINYPAN_BNEP_TX_TIMEOUT_MS) {
                 TINYPAN_LOG_ERROR("transport_bnep: TX cleanup timeout (job=%p)", (void*)job);
@@ -405,8 +449,10 @@ void bnep_transport_flush_tx_queue(void) {
         /* Hardening: We MUST NOT free an in-flight packet during a standard flush
          * because the hardware DMA controller might still be physically reading it
          * over the memory bus. If the link is truly dead, the BNEP TX timeout logic
-         * will independently reclaim this memory after waiting for DMA shutdown. */
-        if (job->in_flight) {
+         * will independently reclaim this memory after waiting for DMA shutdown.
+         * Same for a job whose send_iovec() is actively copying the pbuf in tp_tx
+         * (writing flag) — the drain's session-generation check reclaims it. */
+        if (job->in_flight || job->writing) {
             break;
         }
 

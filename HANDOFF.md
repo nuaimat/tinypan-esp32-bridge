@@ -1,5 +1,105 @@
 # TinyPAN Bridge — Status Handoff
 
+## Session 2026-11-18 — reliability audit of GitHub HEAD (cb52be3) + fixes
+
+Audit of the current v0.3-dev (the Sep-1 state: tp_tx task, TX-wedge
+self-recovery, adaptive probe threshold, AMPDU heap fix all present).
+Respects the ADR: **no throughput surgery** — the wedge is phone-side.
+These are correctness/build fixes only.
+
+### Findings (verified, with evidence)
+
+1. **`VFS_WRITE_TIMEOUT=500` never took effect on stock ESP-IDF.**
+   `btc_l2cap.c` hard-`#define`s it to `(40 * 1000)` in v5.4, v5.5 AND
+   v6.1 (checked all three). The `-D` override in CMakeLists.txt only
+   produces `warning: "VFS_WRITE_TIMEOUT" redefined` (captured in a clean
+   build) — `write()` still blocks up to **40 s**, not 500 ms. The
+   "timeouts fire at the 500 ms cap" observation in the ADR must have
+   come from the locally patched Mac IDF, not the repo config.
+2. **Keepalive still froze the main loop.** `bnep_transport_process()`
+   sent the 2 s BNEP keepalive via blocking `hal_bt_l2cap_send()` from the
+   app loop. With finding 1, a congested VFS queue could freeze the main
+   loop (hal_bt_poll, watchdog, station polling) for up to 40 s — the
+   exact failure mode tp_tx was created to eliminate, still alive via the
+   keepalive path.
+3. **flush-vs-drain race (use-after-free / double-free).** The drain
+   releases `s_bnep_tx_mutex` during `send_iovec()`. On disconnect,
+   `flush_tx_queue()` (app task) frees `job->p` and advances head — in
+   synchronous-TX mode `in_flight` is false during the write, so nothing
+   stopped the flush from freeing the pbuf tp_tx was copying from, then
+   the drain's success path double-freed it and skipped a live job.
+   Window is huge with 40 s blocks, and the TX-wedge recovery *deliberately
+   bounces PAN while tp_tx may be blocked in write()* — so this race was
+   reachable in normal self-recovery operation.
+4. **Mutex leak (deadlock landmine).** The in-flight TX-timeout path in
+   `bnep_transport_drain_tx_queue()` returned without unlocking
+   `s_bnep_tx_mutex` → permanent deadlock of output()/drain/flush.
+   Dormant with SYNCHRONOUS_TX=1 (in_flight never set) but one refactor
+   away. Same bug exists upstream in Akhil-Chaturvedi/TinyPAN.
+5. **Repo did not link on a clean ESP-IDF v5.5 build:**
+   `region 'iram0_0_seg' overflowed by 1144 bytes` (reproduced on HEAD
+   before fixes). New builders could not produce firmware.
+6. **DNS forwarder silent-drop + unbounded stale-reply wait.** `sendto`
+   failure dropped the query with no response (client waits out its own
+   5-10 s resolver timeout), and each discarded stale reply restarted the
+   full 1.5 s `recvfrom` wait — a stream of stale replies could stall the
+   serialized forwarder well past 1.5 s.
+
+### Fixes applied (this commit)
+
+- `tinypan_bnep_transport.c`: keepalive deferred to tp_tx (`s_keepalive_due`
+  + semaphore give) — **no blocking write remains in the app main loop**;
+  per-job `writing` flag (flush/GC skip it) + `s_session_gen` check after
+  the blocking send reclaims the writing job and everything queued behind
+  it (no double-free, no stale-session packets into the next BNEP session);
+  mutex unlock on the TX-timeout return path.
+- `captive_dns.c`: `dns_send_servfail()` helper; SERVFAIL on sendto failure
+  (+ one bounded 20 ms retry on ENOMEM/ENOBUFS); per-query budget
+  `DNS_FWD_QUERY_BUDGET_MS=2000` with per-iteration `SO_RCVTIMEO` =
+  remaining time (stale replies can no longer extend the wait). Kept the
+  1.5 s base timeout, queue depth 32, and ENOMEM log-spam suppression.
+- `CMakeLists.txt`: removed the ineffective `VFS_WRITE_TIMEOUT=500`
+  define; comment documents why the firmware tolerates 40 s blocks
+  (tp_tx confinement + EPIPE wake on close + 15 s wedge detector).
+  quota=2 / GAP_DATA_BUF_SIZE=2048 / link-policy overrides unchanged.
+- `sdkconfig.defaults`: `CONFIG_ESP_WIFI_IRAM_OPT=n`,
+  `CONFIG_ESP_WIFI_RX_IRAM_OPT=n`,
+  `CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH=y` → IRAM ~71% (was
+  overflowing). Trade-off: WiFi code runs from flash; brief WiFi pause
+  during NVS/SPIFFS writes (config saves only). BT is the bottleneck,
+  not WiFi.
+- `README.md`: architecture bullet for tp_tx.
+
+### Deliberately NOT changed
+
+- No TX-pipeline/throughput surgery (ADR: phone-side ceiling ~35%).
+- tp_tx priority, quota=2, QoS 0x80, PREFER_WIFI, DNS queue 32,
+  resilience STALLED/adaptive thresholds, wedge-recovery timings — all
+  hardware-verified tuning, left as-is.
+- Candidate for a future pass (not applied): `CONFIG_LWIP_IPV6=y` costs
+  heap (ip_addr_t 20+ B → DNS queue ~17 KB) while the bridge is IPv4-NAPT
+  only; disabling IPv6 would free heap and stop blackholing client IPv6
+  traffic. Needs a hardware re-test before changing.
+
+### Verification
+
+- Clean `idf.py build` (esp32, stock ESP-IDF v5.5 at ~/esp-idf,
+  `IDF_PYTHON_ENV_PATH=~/.espressif/python_env/idf5.5_py3.11_env`):
+  links, no VFS_WRITE_TIMEOUT redefinition warning, IRAM ~71%,
+  app partition ~36% free.
+- **No hardware load test** — no ESP32 attached to this Linux host.
+  When hardware is available: sustained ping/browsing from a WiFi client;
+  expect main-loop heap/txstat logs to keep ticking under load, wedge
+  recovery bounces to be clean (no heap corruption / crashes after
+  `TX wedge:` bounces), dnsstat timeouts ≤ ~2 s, SERVFAILs instead of
+  client-side resolver stalls on sendto errors.
+- The Mac's local IDF patches (packet_fragmenter.c assert→drop,
+  btc_l2cap.c timeout if patched) are no longer required for correctness
+  of the TX path; the fragmenter patch is still recommended for
+  iPhone-burst OOM resilience (upstream IDF still asserts).
+
+---
+
 **Date:** 2026-09-01 (supersedes 2026-08-27 session)
 **Repo:** `/Users/nuaimat/code/esp_others/tinypan`
 **Branch:** `v0.3-dev`

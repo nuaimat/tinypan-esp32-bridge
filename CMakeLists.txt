@@ -39,15 +39,15 @@ target_compile_definitions(__idf_bt PRIVATE
     # worst case need is BT_HDR(8) + L2CAP_MIN_OFFSET(13) + 1691 = 1712.
     # 2048 halves the per-buffer heap cost with a safe margin.
     GAP_DATA_BUF_SIZE=2048
-    # Cap the L2CAP VFS write() block at 500ms (default 40s). When
-    # Bluedroid's 10-slot TX fixed-queue is full and the radio drains
-    # slower than the drain pushes, write() would otherwise block the
-    # full 40s — overflowing TinyPAN's bounded TX queue (errno=12 storm)
-    # and starving lwIP. 500ms lets write() return EBUSY so the HAL's
-    # EBUSY/EAGAIN -> request_can_send_now() backoff path engages; the
-    # SLOT_TX_QUEUE_LOW_WM early-wake still unblocks faster when the
-    # radio is draining normally.
-    VFS_WRITE_TIMEOUT=500
+    # NOTE: do NOT try to override VFS_WRITE_TIMEOUT here. Stock ESP-IDF
+    # (v5.4 / v5.5 / v6.1) hard-#defines it to (40 * 1000) in btc_l2cap.c,
+    # so -DVFS_WRITE_TIMEOUT=500 only emits a "macro redefined" warning and
+    # has NO effect — write() can still block up to 40 s. The firmware is
+    # designed to tolerate that: ALL blocking L2CAP writes (data-ring drain
+    # AND BNEP keepalives) run in the dedicated tp_tx task, never the app
+    # main loop; close(fd) wakes a blocked write() with EPIPE
+    # (SLOT_CLOSE_BIT); and the resilience TX-wedge detector bounces PAN if
+    # sent stalls for 15 s. A 40 s block stalls only tp_tx.
 )
 
 # ── SPIFFS partition image from main/www/ directory ──────────────

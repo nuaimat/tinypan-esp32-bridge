@@ -32,6 +32,16 @@ CONFIG_ESP_WIFI_RX_BA_WIN=8
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=8
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=8
 CONFIG_ESP_WIFI_MGMT_SBUF_NUM=8
+# IRAM headroom: BT Classic controller + Bluedroid + WiFi + coex overflow
+# iram0_0_seg by 1144 bytes on a clean ESP-IDF v5.5 build with the WiFi
+# IRAM optimizations enabled (the repo did not link for new builders).
+# The bridge is bottlenecked by the BT PAN radio (~300-700 kbps), not
+# WiFi, so move WiFi code to flash (cached) and FreeRTOS functions to
+# flash. Trade-off: WiFi pauses briefly during NVS/SPIFFS writes (rare,
+# config saves only). IRAM usage drops to ~71%.
+CONFIG_ESP_WIFI_IRAM_OPT=n
+CONFIG_ESP_WIFI_RX_IRAM_OPT=n
+CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH=y
 CONFIG_LWIP_NETIF_STATUS_CALLBACK=y
 # SPIFFS
 CONFIG_SPIFFS_CACHE=y

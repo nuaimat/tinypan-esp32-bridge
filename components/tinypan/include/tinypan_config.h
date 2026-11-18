@@ -57,6 +57,22 @@
 #define TINYPAN_TX_QUEUE_LEN                16
 #endif
 
+/**
+ * HAL TX completion semantics.
+ *
+ * 0 (default): the HAL may perform true asynchronous DMA — the transport must
+ *   keep the pbuf alive and wait for HAL_L2CAP_EVENT_TX_COMPLETE before
+ *   freeing it, one packet in flight at a time.
+ * 1: the HAL's send_iovec() copies the payload synchronously (e.g. into a
+ *   Bluetooth VFS/ring buffer) before returning 0. The transport can free the
+ *   pbuf immediately and drain multiple packets per pass, removing the
+ *   one-packet-per-poll throughput ceiling. Backpressure is then supplied by
+ *   send_iovec() returning 1 (busy).
+ */
+#ifndef TINYPAN_HAL_SYNCHRONOUS_TX
+#define TINYPAN_HAL_SYNCHRONOUS_TX           0
+#endif
+
 /* ============================================================================
  * Timeout Configuration (in milliseconds)
  * ============================================================================ */
@@ -212,6 +228,28 @@
  */
 #ifndef TINYPAN_ESP_RX_TASK_PRIO
 #define TINYPAN_ESP_RX_TASK_PRIO            (configMAX_PRIORITIES - 3)
+#endif
+
+/**
+ * Stack size (bytes) for the BNEP TX drain task. This task owns
+ * bnep_transport_drain_tx_queue() so that a blocking L2CAP VFS write() (up to
+ * VFS_WRITE_TIMEOUT=500 ms under WiFi+BT coexistence congestion) cannot stall
+ * the application main
+ * loop, which also runs hal_bt_poll (RX drain + TX_COMPLETE) and the watchdog.
+ */
+#ifndef TINYPAN_BNEP_TX_TASK_STACK
+#define TINYPAN_BNEP_TX_TASK_STACK           4096
+#endif
+
+/**
+ * Priority for the BNEP TX drain task. Must be BELOW the BTU task priority
+ * (BT_TASK_MAX_PRIORITIES - 5, where BT_TASK_MAX_PRIORITIES ==
+ * configMAX_PRIORITIES). The BTU task is what drains the L2CAP VFS TX queue,
+ * so a write() blocked on a full queue can only unblock once the BTU task
+ * runs — the TX task must therefore never be able to preempt it.
+ */
+#ifndef TINYPAN_BNEP_TX_TASK_PRIO
+#define TINYPAN_BNEP_TX_TASK_PRIO            (configMAX_PRIORITIES - 6)
 #endif
 
 /**

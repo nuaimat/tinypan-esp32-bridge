@@ -221,7 +221,12 @@ static void esp_l2cap_cb(esp_bt_l2cap_cb_event_t event,
             /* Set QoS poll interval to balance BT responsiveness with WiFi
              * airtime. Sniff mode is disabled via link policy, so this just
              * controls how often the master polls us. 0x80 = 128 * 0.625ms
-             * = 80ms — less BT polling gives WiFi more RF time. */
+             * = 80ms. 0x40 (40ms) was tried to give the slave more TX slots,
+             * but it starved the WiFi side — iPhone deauthed in bursts
+             * (reason=2 AUTH_EXPIRE, 209 SA_QUERY_TIMEOUT) after ~2.5 min of
+             * sustained BT traffic. With the dedicated TX task +
+             * VFS_WRITE_TIMEOUT=500ms + quota=2, BT TX no longer needs the
+             * aggressive poll (busy=0, wmax<=5ms with 0x40). */
 #ifndef TINYPAN_BT_QOS_POLL
 #define TINYPAN_BT_QOS_POLL 0x80
 #endif
@@ -456,11 +461,13 @@ void hal_bt_poll(void) {
     }
 
     /* Fire deferred completion events (Breaks recursion loop from app task) */
-    if (s_tx_complete_pending) {
-        s_tx_complete_pending = false;
-        if (s_event_cb) {
-            s_event_cb(HAL_L2CAP_EVENT_TX_COMPLETE, 0, s_event_cb_data);
-        }
+    bool tx_complete = false;
+    portENTER_CRITICAL_SAFE(&s_state_spinlock);
+    tx_complete = s_tx_complete_pending;
+    s_tx_complete_pending = false;
+    portEXIT_CRITICAL_SAFE(&s_state_spinlock);
+    if (tx_complete && s_event_cb) {
+        s_event_cb(HAL_L2CAP_EVENT_TX_COMPLETE, 0, s_event_cb_data);
     }
 
     /* Drain L2CAP data from MessageBuffer */
@@ -489,7 +496,9 @@ void hal_bt_drain_events(void) {
     }
 
     /* Also clear the deferred TX complete flag */
+    portENTER_CRITICAL_SAFE(&s_state_spinlock);
     s_tx_complete_pending = false;
+    portEXIT_CRITICAL_SAFE(&s_state_spinlock);
 }
 
 /* ============================================================================
@@ -725,10 +734,9 @@ int hal_bt_l2cap_send_iovec(const tinypan_iovec_t* iov, uint16_t iov_count) {
     portENTER_CRITICAL_SAFE(&s_state_spinlock);
     s_tx_frames++;
     s_tx_bytes += (uint32_t)written;
+    s_tx_complete_pending = true;  /* defer TX_COMPLETE to hal_bt_poll */
     portEXIT_CRITICAL_SAFE(&s_state_spinlock);
 
-    /* Defer TX_COMPLETE to hal_bt_poll */
-    s_tx_complete_pending = true;
     return 0;
 }
 
@@ -832,4 +840,20 @@ void hal_mutex_unlock(hal_mutex_t mutex) {
 
 void hal_mutex_destroy(hal_mutex_t mutex) {
     if (mutex) vSemaphoreDelete((SemaphoreHandle_t)mutex);
+}
+
+/* ============================================================================
+ * Semaphore Implementation (FreeRTOS Binary Semaphores)
+ * ============================================================================ */
+
+hal_semaphore_t hal_semaphore_create(void) {
+    return (hal_semaphore_t)xSemaphoreCreateBinary();
+}
+
+void hal_semaphore_take(hal_semaphore_t sem) {
+    if (sem) xSemaphoreTake((SemaphoreHandle_t)sem, portMAX_DELAY);
+}
+
+void hal_semaphore_give(hal_semaphore_t sem) {
+    if (sem) xSemaphoreGive((SemaphoreHandle_t)sem);
 }

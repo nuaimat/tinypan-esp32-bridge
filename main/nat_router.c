@@ -65,6 +65,9 @@ static void nat_router_teardown(void)
         ESP_LOGI(TAG, "NAPT disabled on AP IP");
     }
 
+    /* Track NAT state for health verification */
+    ap_nat_enabled = false;
+
     /* Disable MSS clamping — no PAN upstream to clamp for */
     ap_mss_clamp = 0;
 
@@ -109,6 +112,7 @@ static void on_pan_event(pan_manager_event_t event)
      * skipped — packets went out with private source IPs and replies
      * were never de-translated. */
     ip_napt_enable(my_ap_ip, 1);
+    ap_nat_enabled = true; /* Track NAT state for health verification */
     ESP_LOGI(TAG, "NAPT enabled on AP IP (LAN side)");
 
     /* Route all outbound traffic through the PAN interface */

@@ -6,23 +6,12 @@
 #include "wifi_config.h"
 
 /* ── IP configuration ─────────────────────────────────────────── */
-uint32_t my_ip      = 0;
 uint32_t my_ap_ip   = 0;
 
-/* ── WiFi AP ──────────────────────────────────────────────────── */
-char *ap_ssid       = NULL;
-char *ap_passwd     = NULL;
-char *ap_dns        = NULL;
-uint8_t ap_ssid_hidden = 0;
-
 /* ── Connection state ─────────────────────────────────────────── */
-uint16_t connect_count = 0;
-bool ap_connect      = false;
-bool ap_nat_enabled  = true;
+bool ap_nat_enabled  = false;
 
 /* ── Byte counters ────────────────────────────────────────────── */
-uint64_t sta_bytes_sent     = 0;
-uint64_t sta_bytes_received = 0;
 uint16_t ap_mss_clamp        = 0;
 
 /* ── DHCP reservations ────────────────────────────────────────── */

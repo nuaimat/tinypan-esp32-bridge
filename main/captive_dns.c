@@ -54,7 +54,17 @@ static int s_fwd_sock = -1;                      /* UDP socket for forwarding + 
 /* Queue to pass DNS queries from lwIP callback to forward task.
  * sendto() cannot be called from the tcpip_thread (it posts back to
  * the same thread), so we defer to a separate task. */
-#define DNS_FWD_QUEUE_LEN 8
+/* ponytail: queue of 8 overflows under a bursty client (Mac retry storm)
+ * because the single fwd_task is serialized on one socket with SO_RCVTIMEO;
+ * 32 covers realistic bursts without meaningful RAM cost (~16 KB). */
+#define DNS_FWD_QUEUE_LEN 32
+/* Per-query reply wait cap: fwd_task discards stale replies (txid mismatch
+ * from a previously timed-out query), but each discard must NOT restart the
+ * full SO_RCVTIMEO wait — otherwise a stream of stale replies can stall the
+ * serialized forwarder indefinitely. The total wait per query is bounded by
+ * this budget; on expiry the client gets SERVFAIL and retries. */
+#define DNS_FWD_RECV_TIMEOUT_MS 1500
+#define DNS_FWD_QUERY_BUDGET_MS 2000
 typedef struct {
     uint8_t data[512];
     uint16_t len;
@@ -86,6 +96,63 @@ static QueueHandle_t s_fwd_queue = NULL;
 
 /* ── Forward task (separate FreeRTOS task) ──────────────────── */
 
+/* ── DNS forward diagnostics ─────────────────────────────────────
+ * fwd_ok/fwd_timeout: replies relayed vs. recvfrom timeouts (each timeout
+ * blocks the serialized fwd_task for the full SO_RCVTIMEO, starving the
+ * queue). rtt_max_ms: worst reply round-trip. Logged every ~10 s. */
+static struct {
+    uint32_t fwd_ok, fwd_timeout, sendto_err;
+    uint32_t rtt_max_ms;
+    uint32_t last_log_ms;
+} s_dnsstat;
+
+static void dns_stat_maybe_log(void)
+{
+    uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    if (now - s_dnsstat.last_log_ms >= 10000) {
+        s_dnsstat.last_log_ms = now;
+        ESP_LOGI(TAG, "dnsstat: ok=%u timeout=%u senderr=%u rtt_max=%ums",
+                 (unsigned)s_dnsstat.fwd_ok, (unsigned)s_dnsstat.fwd_timeout,
+                 (unsigned)s_dnsstat.sendto_err, (unsigned)s_dnsstat.rtt_max_ms);
+        s_dnsstat.rtt_max_ms = 0;
+    }
+}
+
+/* Respond SERVFAIL to a queued query so the client retries immediately
+ * instead of waiting out its own resolver timeout (5-10 s). */
+static void dns_send_servfail(const dns_fwd_msg_t* msg)
+{
+    if (!s_dns_pcb) return;
+    /* Walk past the question name in the original query */
+    uint16_t qname_end = DNS_MIN_QUERY_LEN;
+    while (qname_end < msg->len) {
+        uint8_t label_len = msg->data[qname_end];
+        if (label_len == 0) { qname_end++; break; }
+        if (label_len >= 64) { qname_end = 0; break; }
+        qname_end += label_len + 1;
+        if (qname_end > msg->len) { qname_end = 0; break; }
+    }
+    if (qname_end <= DNS_MIN_QUERY_LEN) return;
+    uint16_t q_end = qname_end + 4;
+    if (q_end > msg->len) return;
+    uint16_t q_len = q_end - DNS_MIN_QUERY_LEN;
+    uint16_t resp_len = DNS_MIN_QUERY_LEN + q_len;
+    struct pbuf *resp = pbuf_alloc(PBUF_TRANSPORT, resp_len, PBUF_RAM);
+    if (!resp) {
+        ESP_LOGE(TAG, "pbuf_alloc(%u) failed for SERVFAIL", resp_len);
+        return;
+    }
+    uint8_t *rdata = (uint8_t *)resp->payload;
+    memcpy(rdata, msg->data, DNS_MIN_QUERY_LEN);
+    rdata[2] = 0x81; rdata[3] = 0x82;  /* SERVFAIL */
+    rdata[6] = rdata[7] = rdata[8] = rdata[9] = rdata[10] = rdata[11] = 0;
+    memcpy(rdata + DNS_MIN_QUERY_LEN, msg->data + DNS_MIN_QUERY_LEN, q_len);
+    LOCK_TCPIP_CORE();
+    udp_sendto(s_dns_pcb, resp, &msg->client_addr, msg->client_port);
+    UNLOCK_TCPIP_CORE();
+    pbuf_free(resp);
+}
+
 static void fwd_task(void *arg)
 {
     (void)arg;
@@ -99,6 +166,7 @@ static void fwd_task(void *arg)
         if (s_fwd_sock < 0) {
             continue;
         }
+        uint32_t q_start_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
         /* Forward query to phone's DNS server */
         struct sockaddr_in dst;
@@ -109,8 +177,24 @@ static void fwd_task(void *arg)
 
         int sent = sendto(s_fwd_sock, msg.data, msg.len, 0,
                           (struct sockaddr *)&dst, sizeof(dst));
+        if (sent <= 0 && (errno == ENOMEM || errno == ENOBUFS)) {
+            /* BNEP TX ring momentarily full — one bounded retry after the
+             * tp_tx task has had a chance to drain it. */
+            vTaskDelay(pdMS_TO_TICKS(20));
+            sent = sendto(s_fwd_sock, msg.data, msg.len, 0,
+                          (struct sockaddr *)&dst, sizeof(dst));
+        }
         if (sent <= 0) {
-            ESP_LOGW(TAG, "DNS forward sendto failed: errno=%d", errno);
+            s_dnsstat.sendto_err++;
+            /* errno 12 (ENOMEM): BT link is congested and lwIP has no pbuf
+             * to send — serves no purpose to spam the console every ~5ms. */
+            if (errno != ENOMEM) {
+                ESP_LOGW(TAG, "DNS forward sendto failed: errno=%d", errno);
+            }
+            /* Tell the client NOW — a silent drop leaves it waiting out
+             * its own resolver timeout. */
+            dns_send_servfail(&msg);
+            dns_stat_maybe_log();
             continue;
         }
         ESP_LOGD(TAG, "DNS query forwarded (%d bytes)", sent);
@@ -120,45 +204,34 @@ static void fwd_task(void *arg)
          * timeout) — discard them and keep waiting rather than relaying a
          * wrong response to the current client. */
         uint16_t query_txid = ((uint16_t)msg.data[0] << 8) | msg.data[1];
+        uint32_t deadline_ms = q_start_ms + DNS_FWD_QUERY_BUDGET_MS;
         for (;;) {
+            /* Bound the TOTAL wait per query: discarding stale replies must
+             * not extend the budget, or one lost reply stalls the queue. */
+            uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            uint32_t remaining = deadline_ms - now;
+            if ((int32_t)remaining <= 0) {
+                s_dnsstat.fwd_timeout++;
+                ESP_LOGW(TAG, "DNS fwd reply budget exhausted (%ums)",
+                         (unsigned)(now - q_start_ms));
+                dns_send_servfail(&msg);
+                break;
+            }
+            if (remaining > DNS_FWD_RECV_TIMEOUT_MS) remaining = DNS_FWD_RECV_TIMEOUT_MS;
+            struct timeval tv = { .tv_sec = remaining / 1000,
+                                  .tv_usec = (remaining % 1000) * 1000 };
+            setsockopt(s_fwd_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
             struct sockaddr_in from;
             socklen_t from_len = sizeof(from);
             int n = recvfrom(s_fwd_sock, reply_buf, sizeof(reply_buf), 0,
                              (struct sockaddr *)&from, &from_len);
             if (n <= 0) {
+                s_dnsstat.fwd_timeout++;
+                ESP_LOGW(TAG, "DNS fwd reply timeout after %lums (errno=%d)",
+                         (unsigned long)(xTaskGetTickCount() * portTICK_PERIOD_MS - q_start_ms),
+                         errno);
                 /* Forward failed — send SERVFAIL to client so it retries */
-                if (s_dns_pcb) {
-                    /* Walk past the question name in the original query */
-                    uint16_t qname_end = DNS_MIN_QUERY_LEN;
-                    while (qname_end < msg.len) {
-                        uint8_t label_len = msg.data[qname_end];
-                        if (label_len == 0) { qname_end++; break; }
-                        if (label_len >= 64) { qname_end = 0; break; }
-                        qname_end += label_len + 1;
-                        if (qname_end > msg.len) { qname_end = 0; break; }
-                    }
-                    if (qname_end > DNS_MIN_QUERY_LEN) {
-                        uint16_t q_end = qname_end + 4;
-                        if (q_end <= msg.len) {
-                            uint16_t q_len = q_end - DNS_MIN_QUERY_LEN;
-                            uint16_t resp_len = DNS_MIN_QUERY_LEN + q_len;
-                            struct pbuf *resp = pbuf_alloc(PBUF_TRANSPORT, resp_len, PBUF_RAM);
-                            if (resp) {
-                                uint8_t *rdata = (uint8_t *)resp->payload;
-                                memcpy(rdata, msg.data, DNS_MIN_QUERY_LEN);
-                                rdata[2] = 0x81; rdata[3] = 0x82;  /* SERVFAIL */
-                                rdata[6] = rdata[7] = rdata[8] = rdata[9] = rdata[10] = rdata[11] = 0;
-                                memcpy(rdata + DNS_MIN_QUERY_LEN, msg.data + DNS_MIN_QUERY_LEN, q_len);
-                                LOCK_TCPIP_CORE();
-                                udp_sendto(s_dns_pcb, resp, &msg.client_addr, msg.client_port);
-                                UNLOCK_TCPIP_CORE();
-                                pbuf_free(resp);
-                            } else {
-                                ESP_LOGE(TAG, "pbuf_alloc(%u) failed for SERVFAIL", resp_len);
-                            }
-                        }
-                    }
-                }
+                dns_send_servfail(&msg);
                 break;
             }
             if (n >= 2) {
@@ -168,6 +241,12 @@ static void fwd_task(void *arg)
                              reply_txid, query_txid);
                     continue;
                 }
+            }
+            {
+                uint32_t rtt = xTaskGetTickCount() * portTICK_PERIOD_MS - q_start_ms;
+                if (rtt > s_dnsstat.rtt_max_ms) s_dnsstat.rtt_max_ms = rtt;
+                s_dnsstat.fwd_ok++;
+                dns_stat_maybe_log();
             }
             if (s_dns_pcb && s_passthrough) {
                 /* Relay the DNS reply back to the original client via raw UDP.
@@ -381,15 +460,21 @@ void captive_dns_set_passthrough(bool enabled)
                     return;
                 }
                 /* Set receive timeout so recvfrom doesn't block too long.
-                 * 5s allows for BT PAN latency (typically 80-300ms via
-                 * 8.8.8.8, but give margin for cellular RTT). */
-                struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+                 * The fwd_task is fully serialized: a single lost reply
+                 * stalls every queued query for the full SO_RCVTIMEO.
+                 * 1.5s still gives ~5-10x margin over the typical
+                 * 80-300ms BT PAN RTT to 8.8.8.8, but bounds worst-case
+                 * queue stall to 1.5s instead of 5s. fwd_task additionally
+                 * enforces a per-query budget (DNS_FWD_QUERY_BUDGET_MS) so
+                 * stale replies cannot extend the wait past the budget. */
+                struct timeval tv = { .tv_sec = DNS_FWD_RECV_TIMEOUT_MS / 1000,
+                                      .tv_usec = (DNS_FWD_RECV_TIMEOUT_MS % 1000) * 1000 };
                 setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
                 s_fwd_sock = sock;
                 /* Start forward task (only once, only with a valid queue) */
                 static bool s_fwd_task_started = false;
                 if (!s_fwd_task_started) {
-                    if (xTaskCreate(fwd_task, "dns_fwd", 3072, NULL, 3, NULL) == pdPASS) {
+                    if (xTaskCreate(fwd_task, "dns_fwd", 6144, NULL, 3, NULL) == pdPASS) {
                         s_fwd_task_started = true;
                     } else {
                         ESP_LOGE(TAG, "Failed to create DNS fwd task");

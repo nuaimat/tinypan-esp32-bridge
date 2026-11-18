@@ -6,6 +6,7 @@
 #include "esp_netif.h"
 #include "esp_event.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 #include "bt_manager.h"
 #include "bt_state.h"
 #include "wifi_ap.h"
@@ -35,6 +36,9 @@ static bool     s_bt_paused_for_wifi = false;
 static uint32_t s_bt_pause_start_ms  = 0;
 static esp_bd_addr_t s_paused_bt_bda;  /* saved for reconnect */
 static bool     s_has_paused_bt_bda  = false;
+static uint32_t s_bt_reconnect_start_ms = 0; /* non-blocking reconnect timer */
+static bool     s_bt_suspend_pending = false;  /* wait for ACL disconnect, then suspend controller */
+static bool     s_bt_suspended = false;        /* BT controller is disabled (RF given to WiFi) */
 
 /* Resilience watchdog: we set this flag when intentionally disconnecting
  * BT for WiFi handshake, so the watchdog doesn't interpret it as a link
@@ -157,6 +161,7 @@ static void disconnect_bt_for_wifi(const char *reason)
     tinypan_stop();
     s_bt_paused_for_wifi = true;
     s_bt_pause_start_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    s_bt_suspend_pending = true;  /* suspend controller after ACL disconnects */
     resilience_set_reconnect_in_progress(true);
 }
 
@@ -168,19 +173,41 @@ static void reconnect_bt(void)
         bt_state_set_reconnect_suppressed(false);
         return;
     }
-    ESP_LOGI(TAG, "Reconnecting BT to saved BDA");
+    ESP_LOGI(TAG, "Reconnecting BT to saved BDA (delayed)");
     tinypan_set_remote_addr(s_paused_bt_bda);
-    /* Delay to let stale L2CAP disconnect callbacks drain before starting
-     * a new connection. Without this, the supervisor gets a stale disconnect
-     * during CONNECTING and enters a reconnect loop. */
-    vTaskDelay(pdMS_TO_TICKS(BT_RECONNECT_DELAY_MS));
-    tinypan_start();
-    s_bt_paused_for_wifi = false;
-    /* Re-enable bt_state auto-reconnect now that BT is intentionally
-     * back — future ACL drops are genuine link failures again. */
-    bt_state_set_reconnect_suppressed(false);
-    /* resilience_set_reconnect_in_progress(false) will be called
-     * by resilience_notify_online() when PAN comes back up. */
+    /* Non-blocking delay: schedule the actual start() after BT_RECONNECT_DELAY_MS.
+     * We do NOT call vTaskDelay here — that would block the entire main task
+     * for 3 seconds, stalling LED updates, DNS passthrough toggling,
+     * pan_manager_process(), and bt_state_process(). */
+    s_bt_reconnect_start_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+}
+
+/**
+ * Poll non-blocking reconnect timer.
+ * Called every iteration from poll_station_changes().
+ */
+static void poll_bt_reconnect_timer(void)
+{
+    if (s_bt_reconnect_start_ms == 0) {
+        return; /* No pending reconnect */
+    }
+    uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    if ((int32_t)(now - s_bt_reconnect_start_ms) >= BT_RECONNECT_DELAY_MS) {
+        ESP_LOGI(TAG, "BT reconnect timer expired — starting connection");
+        /* Re-enable the BT controller + Bluedroid before initiating
+         * a new connection. bt_manager_suspend() disabled them to give
+         * WiFi exclusive RF access during the EAPOL handshake. */
+        if (s_bt_suspended) {
+            bt_manager_resume();
+            s_bt_suspended = false;
+        }
+        tinypan_start();
+        s_bt_paused_for_wifi = false;
+        bt_state_set_reconnect_suppressed(false);
+        /* resilience_set_reconnect_in_progress(false) will be called
+         * by resilience_notify_online() when PAN comes back up. */
+        s_bt_reconnect_start_ms = 0; /* Reset timer */
+    }
 }
 
 static void poll_station_changes(void)
@@ -189,6 +216,26 @@ static void poll_station_changes(void)
     static int      s_last_count = 0;
     static uint32_t s_no_stations_since_ms = 0;  /* 0 = not tracking */
     static bool     s_ondemand_active = false;   /* set true after boot grace period */
+
+    /* Poll the non-blocking BT reconnect timer first — must run every iteration. */
+    poll_bt_reconnect_timer();
+
+    /* Deferred BT controller suspend: tinypan_stop() closes the L2CAP/BNEP
+     * connection but the ACL link lingers for several seconds at the BT
+     * controller level. We must wait for the ACL to fully disconnect
+     * (bt_state → IDLE) before disabling the controller, otherwise
+     * esp_bt_controller_disable() fails. Once suspended, the ESP32 coex
+     * system sets coexist=0, giving WiFi exclusive RF access for the
+     * EAPOL 4-way handshake. */
+    if (s_bt_suspend_pending) {
+        bt_state_t bstate = bt_state_machine_get_state();
+        if (bstate == BT_STATE_IDLE) {
+            ESP_LOGI(TAG, "ACL disconnected — suspending BT controller for WiFi RF exclusivity");
+            bt_manager_suspend();
+            s_bt_suspended = true;
+            s_bt_suspend_pending = false;
+        }
+    }
 
     uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
     if (now - s_last_check_ms < 250) {
@@ -221,7 +268,13 @@ static void poll_station_changes(void)
             /* If BT is already paused (on-demand mode), keep it paused
              * for the EAPOL handshake */
 
-            wifi_ap_boost_wifi_for_handshake(15000);
+            /* Only boost WiFi PS when BT controller is still active (coex=1).
+             * When BT is suspended (coex=0), WiFi already has exclusive RF
+             * and switching to WIFI_PS_NONE mid-handshake can disrupt the
+             * in-progress EAPOL exchange. Keep MIN_MODEM in that case. */
+            if (!s_bt_suspended) {
+                wifi_ap_boost_wifi_for_handshake(15000);
+            }
             wifi_ap_bt_pause(15000);
         } else {
             /* Station left — start no-stations timer */
@@ -242,8 +295,10 @@ static void poll_station_changes(void)
     /* Check if the WiFi boost window has expired */
     wifi_ap_poll_handshake_timeout();
 
-    /* If BT is paused and a station completed the handshake, reconnect BT */
-    if (s_bt_paused_for_wifi && n > 0 && wifi_ap_check_handshake_completed()) {
+    /* If BT is paused and a station completed the handshake, reconnect BT.
+     * Skip if a reconnect is already scheduled (s_bt_reconnect_start_ms != 0). */
+    if (s_bt_paused_for_wifi && n > 0 && s_bt_reconnect_start_ms == 0 &&
+        wifi_ap_check_handshake_completed()) {
         ESP_LOGI(TAG, "WiFi handshake completed — reconnecting BT");
         reconnect_bt();
     }
@@ -266,7 +321,7 @@ static void poll_station_changes(void)
      * ~50-100ms — so `now < s_bt_pause_start_ms` and an unsigned
      * subtraction underflows to ~4.29e9, firing this timeout instantly
      * and causing a BT disconnect/reconnect churn loop every ~13s. */
-    if (s_bt_paused_for_wifi) {
+    if (s_bt_paused_for_wifi && s_bt_reconnect_start_ms == 0) {
         uint32_t now_fresh = xTaskGetTickCount() * portTICK_PERIOD_MS;
         if ((int32_t)(now_fresh - s_bt_pause_start_ms) > (int32_t)BT_ONDEMAND_MAX_PAUSE_MS) {
             ESP_LOGW(TAG, "BT pause timeout (%ds) — reconnecting to keep tethering alive",
@@ -370,12 +425,21 @@ void app_main(void) {
                 }
             }
         }
+        /* Name is optional in NVS — fall back to the BDA so logs are identifiable */
+        char dev_id[32];
+        if (bonded.name[0]) {
+            snprintf(dev_id, sizeof(dev_id), "%s", bonded.name);
+        } else {
+            snprintf(dev_id, sizeof(dev_id), "%02x:%02x:%02x:%02x:%02x:%02x",
+                     bonded.bda[0], bonded.bda[1], bonded.bda[2],
+                     bonded.bda[3], bonded.bda[4], bonded.bda[5]);
+        }
         if (has_bonded) {
             ESP_LOGI(TAG, "Found bonded device \"%s\" — will auto-connect after delay",
-                     bonded.name);
+                     dev_id);
         } else {
             ESP_LOGW(TAG, "Saved device \"%s\" no longer bonded — skipping",
-                     bonded.name);
+                     dev_id);
         }
     } else {
         ESP_LOGI(TAG, "No bonded device in NVS — waiting for pairing");
@@ -422,6 +486,20 @@ void app_main(void) {
 
         /* Resilience watchdog: upstream probes, NAT health, reboot fallback */
         resilience_process();
+
+        /* Periodic heap diagnostics — track heap exhaustion under load */
+        {
+            static uint32_t s_last_heap_log_ms = 0;
+            uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            if (now_ms - s_last_heap_log_ms >= 10000) {
+                s_last_heap_log_ms = now_ms;
+                ESP_LOGI(TAG, "heap: free=%lu min=%lu largest=%u",
+                         (unsigned long)esp_get_free_heap_size(),
+                         (unsigned long)esp_get_minimum_free_heap_size(),
+                         heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+                bnep_transport_log_stats();
+            }
+        }
 
         vTaskDelay(pdMS_TO_TICKS(5));
     }

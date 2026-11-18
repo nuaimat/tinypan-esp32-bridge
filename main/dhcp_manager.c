@@ -8,6 +8,8 @@
 #include <strings.h>
 #include "esp_log.h"
 #include "nvs.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "lwip/ip4_addr.h"
 #include "dhcpserver/dhcpserver.h"
 #include "esp_wifi.h"
@@ -20,10 +22,37 @@
 
 static const char *TAG = "dhcp_mgr";
 
+/* Serializes access to the shared dhcp_reservations[] table.
+ * Writers run on the HTTP/console tasks; readers run on the lwIP tcpip
+ * thread (DHCP server lookups). Created during get_dhcp_reservations(),
+ * which main.c calls at boot before any reader can run. */
+static SemaphoreHandle_t s_reservations_mutex = NULL;
+
+static inline void reservations_lock(void)
+{
+    if (s_reservations_mutex != NULL) {
+        xSemaphoreTake(s_reservations_mutex, portMAX_DELAY);
+    }
+}
+
+static inline void reservations_unlock(void)
+{
+    if (s_reservations_mutex != NULL) {
+        xSemaphoreGive(s_reservations_mutex);
+    }
+}
+
 esp_err_t get_dhcp_reservations() {
     esp_err_t err;
     nvs_handle_t nvs;
     size_t len;
+
+    if (s_reservations_mutex == NULL) {
+        s_reservations_mutex = xSemaphoreCreateMutex();
+        if (s_reservations_mutex == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
 
     err = nvs_open(PARAM_NAMESPACE, NVS_READWRITE, &nvs);
     if (err != ESP_OK) {
@@ -31,14 +60,16 @@ esp_err_t get_dhcp_reservations() {
     }
     err = nvs_get_blob(nvs, "dhcp_res", NULL, &len);
     if (err == ESP_OK) {
+        /* Boot-time-only path: the lock is only held for the NVS read itself. */
+        reservations_lock();
         if (len != DHCP_RES_SIZE) {
+            /* Stored blob has wrong size — reset to avoid stale data */
+            memset(dhcp_reservations, 0, DHCP_RES_SIZE);
             err = ESP_ERR_NVS_INVALID_LENGTH;
-        } else {
-            err = nvs_get_blob(nvs, "dhcp_res", dhcp_reservations, &len);
-            if (err != ESP_OK) {
-                memset(dhcp_reservations, 0, DHCP_RES_SIZE);
-            }
+        } else if ((err = nvs_get_blob(nvs, "dhcp_res", dhcp_reservations, &len)) != ESP_OK) {
+            memset(dhcp_reservations, 0, DHCP_RES_SIZE);
         }
+        reservations_unlock();
     }
     nvs_close(nvs);
 
@@ -46,6 +77,7 @@ esp_err_t get_dhcp_reservations() {
 }
 
 void print_dhcp_reservations() {
+    reservations_lock();
     for (int i = 0; i < MAX_DHCP_RESERVATIONS; i++) {
         if (dhcp_reservations[i].valid) {
             printf("%02X:%02X:%02X:%02X:%02X:%02X -> ",
@@ -65,6 +97,7 @@ void print_dhcp_reservations() {
             printf("\n");
         }
     }
+    reservations_unlock();
 }
 
 void get_dhcp_pool_range(uint32_t server_ip, uint32_t *start_ip, uint32_t *end_ip) {
@@ -110,7 +143,9 @@ void print_dhcp_pool() {
 
 esp_err_t add_dhcp_reservation(const uint8_t *mac, uint32_t ip, const char *name) {
     esp_err_t err;
+    struct dhcp_reservation_entry snapshot[MAX_DHCP_RESERVATIONS];
 
+    reservations_lock();
     // Check if MAC already exists and update it
     for (int i = 0; i < MAX_DHCP_RESERVATIONS; i++) {
         if (dhcp_reservations[i].valid &&
@@ -123,6 +158,8 @@ esp_err_t add_dhcp_reservation(const uint8_t *mac, uint32_t ip, const char *name
             } else {
                 dhcp_reservations[i].name[0] = '\0';
             }
+            memcpy(snapshot, dhcp_reservations, sizeof(snapshot));
+            reservations_unlock();
             goto save;
         }
     }
@@ -139,13 +176,16 @@ esp_err_t add_dhcp_reservation(const uint8_t *mac, uint32_t ip, const char *name
                 dhcp_reservations[i].name[0] = '\0';
             }
             dhcp_reservations[i].valid = 1;
+            memcpy(snapshot, dhcp_reservations, sizeof(snapshot));
+            reservations_unlock();
             goto save;
         }
     }
+    reservations_unlock();
     return ESP_ERR_NO_MEM;
 
 save:
-    err = set_config_param_blob("dhcp_res", dhcp_reservations, DHCP_RES_SIZE);
+    err = set_config_param_blob("dhcp_res", snapshot, sizeof(snapshot));
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "DHCP reservations stored.");
     }
@@ -153,29 +193,45 @@ save:
 }
 
 esp_err_t del_dhcp_reservation(const uint8_t *mac) {
+    struct dhcp_reservation_entry snapshot[MAX_DHCP_RESERVATIONS];
+    bool found = false;
+
+    reservations_lock();
     for (int i = 0; i < MAX_DHCP_RESERVATIONS; i++) {
         if (dhcp_reservations[i].valid &&
             memcmp(dhcp_reservations[i].mac, mac, 6) == 0) {
             dhcp_reservations[i].valid = 0;
-
-            esp_err_t err = set_config_param_blob("dhcp_res", dhcp_reservations, DHCP_RES_SIZE);
-            if (err == ESP_OK) {
-                ESP_LOGI(TAG, "DHCP reservations stored.");
-            }
-            return err;
+            found = true;
+            break;
         }
     }
-    return ESP_OK;
+    memcpy(snapshot, dhcp_reservations, sizeof(snapshot));
+    reservations_unlock();
+
+    if (!found) {
+        return ESP_OK;
+    }
+
+    esp_err_t err = set_config_param_blob("dhcp_res", snapshot, sizeof(snapshot));
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "DHCP reservations stored.");
+    }
+    return err;
 }
 
 esp_err_t clear_all_dhcp_reservations() {
+    struct dhcp_reservation_entry snapshot[MAX_DHCP_RESERVATIONS];
+
+    reservations_lock();
     // Clear all reservation entries
     for (int i = 0; i < MAX_DHCP_RESERVATIONS; i++) {
         dhcp_reservations[i].valid = 0;
     }
+    memcpy(snapshot, dhcp_reservations, sizeof(snapshot));
+    reservations_unlock();
 
     // Save cleared table to NVS
-    esp_err_t err = set_config_param_blob("dhcp_res", dhcp_reservations, DHCP_RES_SIZE);
+    esp_err_t err = set_config_param_blob("dhcp_res", snapshot, sizeof(snapshot));
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "All DHCP reservations cleared.");
     }
@@ -183,35 +239,47 @@ esp_err_t clear_all_dhcp_reservations() {
 }
 
 uint32_t lookup_dhcp_reservation(const uint8_t *mac) {
+    uint32_t result = 0;
+    reservations_lock();
     for (int i = 0; i < MAX_DHCP_RESERVATIONS; i++) {
         if (dhcp_reservations[i].valid &&
             memcmp(dhcp_reservations[i].mac, mac, 6) == 0) {
-            return dhcp_reservations[i].ip;
+            result = dhcp_reservations[i].ip;
+            break;
         }
     }
-    return 0;
+    reservations_unlock();
+    return result;
 }
 
 bool is_ip_reserved_for_other(uint32_t ip, const uint8_t *mac) {
     if (ip == 0) return false;
+    bool result = false;
+    reservations_lock();
     for (int i = 0; i < MAX_DHCP_RESERVATIONS; i++) {
         if (dhcp_reservations[i].valid &&
             dhcp_reservations[i].ip == ip &&
             memcmp(dhcp_reservations[i].mac, mac, 6) != 0) {
-            return true;
+            result = true;
+            break;
         }
     }
-    return false;
+    reservations_unlock();
+    return result;
 }
 
 bool is_mac_blocked(const uint8_t *mac) {
+    bool result = false;
+    reservations_lock();
     for (int i = 0; i < MAX_DHCP_RESERVATIONS; i++) {
         if (dhcp_reservations[i].valid &&
             memcmp(dhcp_reservations[i].mac, mac, 6) == 0) {
-            return dhcp_reservations[i].ip == 0;
+            result = (dhcp_reservations[i].ip == 0);
+            break;
         }
     }
-    return false;
+    reservations_unlock();
+    return result;
 }
 
 const char* lookup_device_name_by_ip(uint32_t ip) {
@@ -240,15 +308,21 @@ bool resolve_device_name_to_ip(const char *name, uint32_t *ip) {
     if (name == NULL || ip == NULL) {
         return false;
     }
+    bool result = false;
+    uint32_t found_ip = 0;
+    reservations_lock();
     for (int i = 0; i < MAX_DHCP_RESERVATIONS; i++) {
         if (dhcp_reservations[i].valid &&
             dhcp_reservations[i].name[0] != '\0' &&
             strcasecmp(dhcp_reservations[i].name, name) == 0) {
-            *ip = dhcp_reservations[i].ip;
-            return true;
+            found_ip = dhcp_reservations[i].ip;
+            result = true;
+            break;
         }
     }
-    return false;
+    reservations_unlock();
+    *ip = found_ip;
+    return result;
 }
 
 int get_connected_clients(connected_client_t *clients, int max_clients) {
@@ -295,6 +369,8 @@ int get_connected_clients(connected_client_t *clients, int max_clients) {
         }
 
         // Look up device name in DHCP reservations (overrides DHCP hostname)
+        // Reads the shared reservation table, so serialize with the mutex.
+        reservations_lock();
         for (int j = 0; j < MAX_DHCP_RESERVATIONS; j++) {
             if (dhcp_reservations[j].valid &&
                 memcmp(dhcp_reservations[j].mac, sta->mac, 6) == 0) {
@@ -307,6 +383,7 @@ int get_connected_clients(connected_client_t *clients, int max_clients) {
                 break;
             }
         }
+        reservations_unlock();
 
         count++;
     }

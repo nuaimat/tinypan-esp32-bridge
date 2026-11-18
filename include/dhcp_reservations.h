@@ -46,6 +46,23 @@ typedef struct {
 
 extern struct dhcp_reservation_entry dhcp_reservations[];
 
+/**
+ * @defgroup dhcp_reservations Thread-safety contract
+ *
+ * The shared reservation table (dhcp_reservations[]) is protected by an
+ * internal FreeRTOS mutex. All functions below that read or mutate the
+ * table are safe to call from any task context (HTTP server task, UART
+ * console task, or the lwIP tcpip thread that runs the DHCP server).
+ *
+ * EXCEPTIONS:
+ *  - lookup_device_name_by_ip()/lookup_device_name_by_mac() return a
+ *    pointer INTO the shared table. The pointer is only valid until the
+ *    next mutation; callers must not hold it across another reservation
+ *    change. These helpers are currently unused.
+ *  - dhcp_reservations[] itself is exposed for the custom DHCP server; do
+ *    not access it directly without holding the internal lock.
+ */
+
 esp_err_t get_dhcp_reservations(void);
 void print_dhcp_reservations(void);
 esp_err_t add_dhcp_reservation(const uint8_t *mac, uint32_t ip, const char *name);

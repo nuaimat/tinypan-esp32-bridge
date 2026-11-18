@@ -166,6 +166,35 @@ bool bt_manager_is_connected(void);
  */
 esp_err_t bt_manager_get_peer_bda(esp_bd_addr_t bda);
 
+/* ── RF suspend/resume for WiFi coexistence ─────────────────────── */
+
+/**
+ * @brief  Suspend the BT stack (Bluedroid + controller) to give WiFi
+ *         exclusive RF access.
+ *
+ *         Disables Bluedroid and the BT controller so the ESP32 coex
+ *         system sets coexist=0, allowing WIFI_PS_NONE to take full
+ *         effect for EAPOL handshake reliability.  The BT stack can
+ *         be resumed with bt_manager_resume().
+ *
+ *         Must only be called when no ACL connection is active (i.e.
+ *         after tinypan_stop() and the ACL disconnect has completed).
+ *
+ * @return ESP_OK on success.
+ */
+esp_err_t bt_manager_suspend(void);
+
+/**
+ * @brief  Resume the BT stack after a prior bt_manager_suspend().
+ *
+ *         Re-enables the BT controller and Bluedroid host stack.
+ *         After resuming, a new connection can be initiated with
+ *         bt_manager_connect() / tinypan_start().
+ *
+ * @return ESP_OK on success.
+ */
+esp_err_t bt_manager_resume(void);
+
 /* ── Pairing / Bonding persistence ──────────────────────────────── */
 
 /**

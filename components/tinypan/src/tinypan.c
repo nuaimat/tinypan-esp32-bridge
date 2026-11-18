@@ -361,9 +361,12 @@ void tinypan_internal_set_ip(uint32_t ip, uint32_t netmask, uint32_t gw, uint32_
 }
 
 void tinypan_internal_clear_ip(void) {
+    if (!s_has_ip) {
+        return;  /* nothing was ever assigned — not a "loss" */
+    }
     s_has_ip = false;
     memset(&s_ip_info, 0, sizeof(s_ip_info));
-    
+
     supervisor_on_ip_lost();
 
     tinypan_state_t current_state = supervisor_get_state();

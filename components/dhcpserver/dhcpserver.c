@@ -12,6 +12,7 @@
 #include "lwip/pbuf.h"
 #include "lwip/udp.h"
 #include "lwip/mem.h"
+#include "lwip/tcpip.h"
 #include "lwip/ip_addr.h"
 #include "lwip/timeouts.h"
 #include "lwip/etharp.h"
@@ -237,40 +238,40 @@ void *__wrap_dhcps_option_info(dhcps_t *dhcps, u8_t op_id, u32_t opt_len)
     }
 
     switch (op_id) {
-        case IP_ADDRESS_LEASE_TIME:
+        case DHCP_OPT_IP_ADDRESS_LEASE_TIME:
             if (opt_len == sizeof(dhcps_time_t)) {
                 option_arg = &dhcps->dhcps_lease_time;
             }
 
             break;
 
-        case REQUESTED_IP_ADDRESS:
+        case DHCP_OPT_REQUESTED_IP_ADDRESS:
             if (opt_len == sizeof(dhcps_lease_t)) {
                 option_arg = &dhcps->dhcps_poll;
             }
 
             break;
 
-        case ROUTER_SOLICITATION_ADDRESS:
+        case DHCP_OPT_ROUTER_SOLICITATION_ADDRESS:
             if (opt_len == sizeof(dhcps_offer_t)) {
                 option_arg = &dhcps->dhcps_offer;
             }
 
             break;
 
-        case DOMAIN_NAME_SERVER:
+        case DHCP_OPT_DOMAIN_NAME_SERVER:
             if (opt_len == sizeof(dhcps_offer_t)) {
                 option_arg = &dhcps->dhcps_dns;
             }
 
             break;
-        case SUBNET_MASK:
+        case DHCP_OPT_SUBNET_MASK:
             if (opt_len == sizeof(dhcps->dhcps_mask)) {
                 option_arg = &dhcps->dhcps_mask;
             }
 
             break;
-        case CAPTIVEPORTAL_URI:
+        case DHCP_OPT_CAPTIVEPORTAL_URI:
             option_arg = &dhcps->dhcps_captiveportal_uri;
 
             break;
@@ -295,41 +296,41 @@ err_t __wrap_dhcps_set_option_info(dhcps_t *dhcps, u8_t op_id, void *opt_info, u
         return ERR_ARG;
     }
     switch (op_id) {
-        case IP_ADDRESS_LEASE_TIME:
+        case DHCP_OPT_IP_ADDRESS_LEASE_TIME:
             if (opt_len == sizeof(dhcps_time_t)) {
                 dhcps->dhcps_lease_time = *(dhcps_time_t *)opt_info;
             }
 
             break;
 
-        case REQUESTED_IP_ADDRESS:
+        case DHCP_OPT_REQUESTED_IP_ADDRESS:
             if (opt_len == sizeof(dhcps_lease_t)) {
                 dhcps->dhcps_poll = *(dhcps_lease_t *)opt_info;
             }
 
             break;
 
-        case ROUTER_SOLICITATION_ADDRESS:
+        case DHCP_OPT_ROUTER_SOLICITATION_ADDRESS:
             if (opt_len == sizeof(dhcps_offer_t)) {
                 dhcps->dhcps_offer = *(dhcps_offer_t *)opt_info;
             }
 
             break;
 
-        case DOMAIN_NAME_SERVER:
+        case DHCP_OPT_DOMAIN_NAME_SERVER:
             if (opt_len == sizeof(dhcps_offer_t)) {
                 dhcps->dhcps_dns = *(dhcps_offer_t *)opt_info;
             }
             break;
 
-        case SUBNET_MASK:
+        case DHCP_OPT_SUBNET_MASK:
             if (opt_len == sizeof(dhcps->dhcps_mask)) {
                 dhcps->dhcps_mask = *(ip4_addr_t *)opt_info;
             }
 
             break;
 
-        case CAPTIVEPORTAL_URI:
+        case DHCP_OPT_CAPTIVEPORTAL_URI:
             dhcps->dhcps_captiveportal_uri = (char *)opt_info;
             break;
 
@@ -1141,8 +1142,20 @@ static s16_t parse_msg(dhcps_t *dhcps, struct dhcps_msg *m, u16_t len)
             res_addr.addr = reserved_ip;
             old_addr.addr = dhcps->client_address.addr;
 
-            // Always use the reserved IP, regardless of pool range
-            dhcps->client_address.addr = reserved_ip;
+            /* Only use the reserved IP if it falls within the pool range.
+             * Accepting an out-of-range reservation could cause duplicate IPs
+             * or routing issues. */
+            u32_t res_host = ntohl(reserved_ip);
+            u32_t start_h  = ntohl(dhcps->dhcps_poll.start_ip.addr);
+            u32_t end_h    = ntohl(dhcps->dhcps_poll.end_ip.addr);
+
+            if (res_host >= start_h && res_host <= end_h) {
+                dhcps->client_address.addr = reserved_ip;
+            } else {
+                ESP_LOGW(TAG, "DHCP reservation out of pool range (%u.%u.%u.%u), ignoring",
+                    ip4_addr1_16(&res_addr), ip4_addr2_16(&res_addr),
+                    ip4_addr3_16(&res_addr), ip4_addr4_16(&res_addr));
+            }
 
             ESP_LOGI(TAG, "DHCP reservation: MAC %02X:%02X:%02X:%02X:%02X:%02X -> %d.%d.%d.%d (pool would assign %d.%d.%d.%d)",
                 m->chaddr[0], m->chaddr[1], m->chaddr[2],
@@ -1248,10 +1261,7 @@ static void handle_dhcp(void *arg,
     struct dhcps_t *dhcps = arg;
     struct dhcps_msg *pmsg_dhcps = NULL;
     s16_t tlen, malloc_len;
-    u16_t i;
-    u16_t dhcps_msg_cnt = 0;
     u8_t *p_dhcps_msg = NULL;
-    u8_t *data;
     s16_t state;
 
     ESP_LOGI(TAG, "handle_dhcp: received packet, len=%d", p ? p->tot_len : 0);
@@ -1280,52 +1290,26 @@ static void handle_dhcp(void *arg,
 
     p_dhcps_msg = (u8_t *)pmsg_dhcps;
     tlen = p->tot_len;
-    data = p->payload;
 
 #if DHCPS_DEBUG
     DHCPS_LOG("dhcps: handle_dhcp-> p->tot_len = %d\n", tlen);
     DHCPS_LOG("dhcps: handle_dhcp-> p->len = %d\n", p->len);
 #endif
 
-    for (i = 0; i < p->len; i++) {
-        p_dhcps_msg[dhcps_msg_cnt++] = data[i];
-#if DHCPS_DEBUG
-        DHCPS_LOG("%02x ", data[i]);
-
-        if ((i + 1) % 16 == 0) {
-            DHCPS_LOG("\n");
-        }
-
-#endif
-    }
-
-    if (p->next != NULL) {
-#if DHCPS_DEBUG
-        DHCPS_LOG("dhcps: handle_dhcp-> p->next != NULL\n");
-        DHCPS_LOG("dhcps: handle_dhcp-> p->next->tot_len = %d\n", p->next->tot_len);
-        DHCPS_LOG("dhcps: handle_dhcp-> p->next->len = %d\n", p->next->len);
-#endif
-
-        data = p->next->payload;
-
-        for (i = 0; i < p->next->len; i++) {
-            p_dhcps_msg[dhcps_msg_cnt++] = data[i];
-#if DHCPS_DEBUG
-            DHCPS_LOG("%02x ", data[i]);
-
-            if ((i + 1) % 16 == 0) {
-                DHCPS_LOG("\n");
-            }
-
-#endif
-        }
-    }
+    /* Copy all pbuf segments into a contiguous buffer.
+     * Handles any number of pbufs (the original code only copied the
+     * first two segments). Uses pbuf_copy_partial for a bounds-safe copy
+     * that reads exactly tlen bytes regardless of pbuf segmentation. */
+    u16_t bytes_copied = pbuf_copy_partial(p, p_dhcps_msg, tlen, 0);
+    (void)bytes_copied;
 
 #if DHCPS_DEBUG
     DHCPS_LOG("dhcps: handle_dhcp-> parse_msg(p)\n");
 #endif
 
-    state = parse_msg(dhcps, pmsg_dhcps, tlen - 240);
+    /* Guard against underflow: options start at byte 236 (DHCP_MSG_LEN). */
+    s16_t opt_len = (tlen > DHCP_MSG_LEN) ? (s16_t)(tlen - DHCP_MSG_LEN) : 0;
+    state = parse_msg(dhcps, pmsg_dhcps, opt_len);
 #ifdef LWIP_HOOK_DHCPS_POST_STATE
     state = LWIP_HOOK_DHCPS_POST_STATE(pmsg_dhcps, malloc_len, state);
 #endif /* LWIP_HOOK_DHCPS_POST_STATE */
@@ -1451,26 +1435,34 @@ err_t __wrap_dhcps_start(dhcps_t *dhcps, struct netif *netif, ip4_addr_t ip)
     if (dhcps == NULL || netif == NULL) {
         return ERR_ARG;
     }
-    dhcps->dhcps_netif = netif;
-    if (dhcps->dhcps_pcb != NULL) {
-        udp_remove(dhcps->dhcps_pcb);
-    }
 
-    dhcps->dhcps_pcb = udp_new();
-
-    if (dhcps->dhcps_pcb == NULL || ip4_addr_isany_val(ip)) {
-        DHCPS_LOG("dhcps_start(): could not obtain pcb\n");
+    /* Validate configuration BEFORE allocating the UDP PCB so any early
+     * return from the DHCP_CHECK_* macros cannot leak the PCB. */
+    if (ip4_addr_isany_val(ip)) {
+        DHCPS_LOG("dhcps_start(): invalid (zero) server IP\n");
         return ERR_ARG;
     }
 
-    IP4_ADDR(&dhcps->broadcast_dhcps, 255, 255, 255, 255);
-
+    dhcps->dhcps_netif = netif;
     dhcps->server_address.addr = ip.addr;
     DHCP_CHECK_SUBNET_MASK_IP(htonl(dhcps->dhcps_mask.addr));
     DHCP_CHECK_IP_MATCH_SUBNET_MASK(htonl(dhcps->dhcps_mask.addr), htonl(ip.addr));
     dhcps_poll_set(dhcps, dhcps->server_address.addr);
 
     dhcps->client_address_plus.addr = dhcps->dhcps_poll.start_ip.addr;
+
+    if (dhcps->dhcps_pcb != NULL) {
+        udp_remove(dhcps->dhcps_pcb);
+        dhcps->dhcps_pcb = NULL;
+    }
+
+    dhcps->dhcps_pcb = udp_new();
+    if (dhcps->dhcps_pcb == NULL) {
+        DHCPS_LOG("dhcps_start(): could not obtain pcb\n");
+        return ERR_ARG;
+    }
+
+    IP4_ADDR(&dhcps->broadcast_dhcps, 255, 255, 255, 255);
 
     udp_bind_netif(dhcps->dhcps_pcb, dhcps->dhcps_netif);
     udp_bind(dhcps->dhcps_pcb, &netif->ip_addr, DHCPS_SERVER_PORT);
@@ -1719,31 +1711,69 @@ err_t __wrap_dhcps_dns_getserver(dhcps_t *dhcps, ip4_addr_t *dnsserver)
  * Returns      : Number of active leases found
  * Note         : Uses global g_dhcps_instance, safe to call from any context
  ******************************************************************************/
-int dhcps_get_active_leases(dhcp_lease_info_t *leases, int max_leases)
+
+/* Context passed to the tcpip-thread enumeration callback. */
+typedef struct {
+    dhcp_lease_info_t *leases;
+    int max_leases;
+    int count;
+} lease_enum_ctx_t;
+
+/* Runs on the tcpip thread, where the lease list is mutated, so the walk
+ * is race-free without needing a separate lock. */
+static void lease_enum_cb(void *arg)
 {
+    lease_enum_ctx_t *ctx = (lease_enum_ctx_t *)arg;
     struct dhcps_pool *pdhcps_pool = NULL;
     list_node *pback_node = NULL;
     int count = 0;
 
-    if (leases == NULL || max_leases <= 0 || g_dhcps_instance == NULL) {
-        return 0;
+    if (ctx == NULL || ctx->leases == NULL || ctx->max_leases <= 0 ||
+        g_dhcps_instance == NULL) {
+        if (ctx != NULL) {
+            ctx->count = 0;
+        }
+        return;
     }
 
     for (pback_node = g_dhcps_instance->plist;
-         pback_node != NULL && count < max_leases;
+         pback_node != NULL && count < ctx->max_leases;
          pback_node = pback_node->pnext) {
         pdhcps_pool = pback_node->pnode;
         if (pdhcps_pool != NULL) {
-            memcpy(leases[count].mac, pdhcps_pool->mac, 6);
-            leases[count].ip = pdhcps_pool->ip.addr;
-            leases[count].lease_timer = pdhcps_pool->lease_timer;
-            strncpy(leases[count].hostname, pdhcps_pool->hostname, sizeof(leases[count].hostname) - 1);
-            leases[count].hostname[sizeof(leases[count].hostname) - 1] = '\0';
+            memcpy(ctx->leases[count].mac, pdhcps_pool->mac, 6);
+            ctx->leases[count].ip = pdhcps_pool->ip.addr;
+            ctx->leases[count].lease_timer = pdhcps_pool->lease_timer;
+            strncpy(ctx->leases[count].hostname, pdhcps_pool->hostname,
+                    sizeof(ctx->leases[count].hostname) - 1);
+            ctx->leases[count].hostname[sizeof(ctx->leases[count].hostname) - 1] = '\0';
             count++;
         }
     }
+    ctx->count = count;
+}
 
-    return count;
+int dhcps_get_active_leases(dhcp_lease_info_t *leases, int max_leases)
+{
+    if (leases == NULL || max_leases <= 0) {
+        return 0;
+    }
+
+    lease_enum_ctx_t ctx = {
+        .leases = leases,
+        .max_leases = max_leases,
+        .count = 0,
+    };
+
+    /* Enumerate on the tcpip thread to serialize with the DHCP server's
+     * list mutations (which all run on that thread). Blocks the caller until
+     * the walk completes. */
+    if (tcpip_callback_wait(lease_enum_cb, &ctx) != ERR_OK) {
+        ESP_LOGW(TAG, "dhcps_get_active_leases: failed to run on tcpip thread");
+        return 0;
+    }
+
+    return ctx.count;
 }
 
 #endif // ESP_DHCPS

@@ -258,6 +258,7 @@ Use the web UI (Settings panel) or run `idf.py menuconfig` → TinyPAN Bridge Co
 - NAPT bridges WiFi clients (`192.168.99.x`) to the PAN interface
 - DNS forwarding: captive DNS on `192.168.99.1:53`, forwards to phone's DNS when PAN is online
 - Static ARP entry for PAN gateway avoids ARP resolution over Bluetooth
+- Dedicated TX task (`tp_tx`): all blocking L2CAP writes (data-ring drain + BNEP keepalives) run outside the main loop, so BT congestion cannot stall the resilience watchdog, RX polling, or WiFi client handling
 
 ### Source layout
 
